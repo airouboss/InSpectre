@@ -36,6 +36,7 @@ from plugin_engine import (
     verify_webhook_signature,
 )
 from email_analysis import run_email_analysis
+import container_updates as _cu
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password123@db:5432/inspectre")
 # PROBE_API_URL is the name used in docker-compose; PROBE_URL is the legacy fallback.
@@ -509,6 +510,8 @@ def _migrate(db: Session):
         )""",
         # IP history: differentiate DHCP rotation from multi-homed
         "ALTER TABLE ip_history ADD COLUMN IF NOT EXISTS seen_while_online BOOLEAN",
+        # User-pinned primary IP (probe's source of truth for locked devices)
+        "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip        VARCHAR",
         # Prevent probe from overriding user-pinned primary IPs
         "ALTER TABLE devices ADD COLUMN IF NOT EXISTS primary_ip_locked BOOLEAN NOT NULL DEFAULT FALSE",
         # DHCP fingerprinting — passively captured by probe sniffer
@@ -600,6 +603,41 @@ def _migrate(db: Session):
             db.rollback()
     db.commit()
 
+    # Install the primary-IP lock trigger as a DB-level backstop against
+    # the probe ever overwriting a user-pinned IP.
+    # The trigger fires whenever OLD.primary_ip_locked=TRUE (regardless of NEW),
+    # unconditionally restoring primary_ip and ip_address from the OLD row.
+    # The backend's two-step re-pin still works:
+    #   Step 1 — SET locked=FALSE: trigger fires but primary_ip isn't changing
+    #            (NEW.primary_ip == OLD.primary_ip), so no visible effect.
+    #   Step 2 — SET primary_ip=X, locked=TRUE: OLD.locked=FALSE, trigger
+    #            doesn't fire, the new pin is written normally.
+    try:
+        db.execute(text("""
+            CREATE OR REPLACE FUNCTION enforce_primary_ip_lock() RETURNS trigger AS $$
+            BEGIN
+                IF OLD.primary_ip_locked THEN
+                    NEW.primary_ip := OLD.primary_ip;
+                    NEW.ip_address := OLD.ip_address;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """))
+        db.execute(text("DROP TRIGGER IF EXISTS trg_enforce_primary_ip_lock ON devices"))
+        db.execute(text("""
+            CREATE TRIGGER trg_enforce_primary_ip_lock
+                BEFORE UPDATE ON devices
+                FOR EACH ROW
+                EXECUTE FUNCTION enforce_primary_ip_lock()
+        """))
+        db.commit()
+    except Exception as _te:
+        print(f"[migrate] primary_ip_lock trigger (non-fatal): {_te}", flush=True)
+        db.rollback()
+    # Container update management tables (container_update_status, container_backups)
+    _cu.migrate(db)
+
 
 # ---------------------------------------------------------------------------
 # Default settings
@@ -671,6 +709,16 @@ DEFAULT_SETTINGS = {
     "trivy_db_update_frequency": ("1d",   "How often to refresh the Trivy vulnerability database. Options: disabled, 1d, 2d, 7d, 30d."),
     "docker_scan_on_new":        ("false", "Automatically run a Trivy vuln scan when a new container is created."),
     "docker_scan_on_update":     ("false", "Automatically run a Trivy vuln scan when a container is recreated with an updated image."),
+    # Container update management
+    "container_auto_update":           ("disabled", "What to do when an update is detected. Options: disabled, notify, scan_then_update, auto."),
+    "container_update_block_critical": ("true",     "Block container updates if the new image contains critical-severity CVEs."),
+    "container_backup_enabled":        ("true",     "Automatically save a full config backup before any container update."),
+    "container_update_health_timeout": ("30",       "Seconds to wait for a container health check after an update before triggering rollback."),
+    "container_update_stagger_seconds":("30",       "Delay in seconds between sequential container updates when running an auto-update batch."),
+    "container_update_pin_labels":     ("true",     "Honour the com.inspectre.update.pin=true Docker label to exclude containers from auto-updates."),
+    "container_check_enabled": ("false", "Enable scheduled container image update checks."),
+    "container_check_hour":    ("3",     "Hour of day (0-23, UTC) to run container update checks."),
+    "container_check_days":    ("[]",    "JSON array of JS day-of-week ints (0=Sun…6=Sat) to run checks. Empty = every day."),
     # Notification — speed test alert thresholds
     "speedtest_expected_download":   ("0",   "Expected/contracted download speed in Mbps. Set to 0 to disable speed test alerts."),
     "speedtest_expected_upload":     ("0",   "Expected/contracted upload speed in Mbps. Set to 0 to disable upload speed alerts."),
@@ -948,6 +996,10 @@ NOTIFICATION_EVENT_DEFS = [
     ("block.schedule_start",        "Block Schedule Started",   "Blocking",        "A block schedule became active"),
     ("block.schedule_end",          "Block Schedule Ended",     "Blocking",        "A block schedule deactivated"),
     ("container.crashed",           "Container Crashed",        "Containers",      "A container exited with a non-zero exit code"),
+    ("container.update_available",  "Container Update Available","Containers",      "A newer image version is available for a container"),
+    ("container.updated",           "Container Updated",         "Containers",      "A container was successfully updated to a new image version"),
+    ("container.update_blocked",    "Container Update Blocked",  "Containers",      "A container update was blocked due to critical CVEs in the new image"),
+    ("container.update_failed",     "Container Update Failed",   "Containers",      "A container update failed and the original was automatically restored"),
     ("traffic.unusual_port",        "Unusual Port Traffic",     "Traffic",         "A device communicated on an unusual port"),
     ("traffic.suspicious_country",  "Suspicious Country Traffic","Traffic",        "A device communicated with a flagged country"),
     ("person.home",                 "Person Arrived Home",      "Person Presence", "A tracked person's device came online (person is home)"),
@@ -1417,19 +1469,28 @@ async def _notification_loop():
                             if days_absent >= returned_days:
                                 dispatches.append(("device.returned", "Device Returned",
                                                    f"{name} ({ip}) reappeared after {days_absent} days", mac))
-                        # person.home: check if this mac belongs to a person now home
+                        # person.home: check if this mac (or any grouped sibling) belongs to a person
                         person_row = db.execute(text("""
                             SELECT p.id::text, p.name FROM persons p
                             JOIN person_devices pd ON pd.person_id = p.id
-                            WHERE pd.mac_address = :mac LIMIT 1
+                            JOIN devices pd_dev ON pd_dev.mac_address = pd.mac_address
+                            JOIN devices trigger_dev ON trigger_dev.mac_address = :mac
+                            WHERE pd.mac_address = :mac
+                               OR (pd_dev.group_id IS NOT NULL
+                                   AND pd_dev.group_id = trigger_dev.group_id)
+                            LIMIT 1
                         """), {"mac": mac}).fetchone()
                         if person_row:
                             pid, pname = person_row
-                            # Person is home if at least one of their devices is online
+                            # Person is home if at least one of their devices (or grouped siblings) is online
                             any_online = db.execute(text("""
                                 SELECT 1 FROM person_devices pd
                                 JOIN devices d ON d.mac_address = pd.mac_address
-                                WHERE pd.person_id = :pid AND d.is_online = true LIMIT 1
+                                LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                    AND sibling.group_id IS NOT NULL
+                                WHERE pd.person_id = :pid
+                                  AND (d.is_online = true OR sibling.is_online = true)
+                                LIMIT 1
                             """), {"pid": pid}).fetchone()
                             if any_online:
                                 dispatches.append(("person.home", "Person Arrived Home",
@@ -1441,19 +1502,28 @@ async def _notification_loop():
                         if is_important:
                             dispatches.append(("device.offline.watched", "Watched Device Offline",
                                                f"{name} ({ip}) went offline", mac))
-                        # person.away: check if this mac belongs to a person now away
+                        # person.away: check if this mac (or any grouped sibling) belongs to a person
                         person_row = db.execute(text("""
                             SELECT p.id::text, p.name FROM persons p
                             JOIN person_devices pd ON pd.person_id = p.id
-                            WHERE pd.mac_address = :mac LIMIT 1
+                            JOIN devices pd_dev ON pd_dev.mac_address = pd.mac_address
+                            JOIN devices trigger_dev ON trigger_dev.mac_address = :mac
+                            WHERE pd.mac_address = :mac
+                               OR (pd_dev.group_id IS NOT NULL
+                                   AND pd_dev.group_id = trigger_dev.group_id)
+                            LIMIT 1
                         """), {"mac": mac}).fetchone()
                         if person_row:
                             pid, pname = person_row
-                            # Person is away if none of their devices are online
+                            # Person is away if none of their devices (or grouped siblings) are online
                             any_online = db.execute(text("""
                                 SELECT 1 FROM person_devices pd
                                 JOIN devices d ON d.mac_address = pd.mac_address
-                                WHERE pd.person_id = :pid AND d.is_online = true LIMIT 1
+                                LEFT JOIN devices sibling ON sibling.group_id = d.group_id
+                                    AND sibling.group_id IS NOT NULL
+                                WHERE pd.person_id = :pid
+                                  AND (d.is_online = true OR sibling.is_online = true)
+                                LIMIT 1
                             """), {"pid": pid}).fetchone()
                             if not any_online:
                                 dispatches.append(("person.away", "Person Left Home",
@@ -1588,6 +1658,7 @@ async def _notification_loop():
 
 
 app = FastAPI(title="InSpectre API", version="1.0.0")
+app.include_router(_cu.router)
 
 _CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS",
@@ -2009,6 +2080,7 @@ _FB_TYPE_MAP: list[tuple[list[str], str]] = [
     (["android tablet", "galaxy tab", "kindle fire"],               "tablet"),
     (["android", "mobile device", "smartphone"],                    "phone"),
     # PCs
+    (["chromebook", "chrome os", "chromeos"],                       "laptop"),
     (["macbook", "imac", "mac mini", "mac pro"],                    "laptop"),
     (["laptop", "notebook"],                                        "laptop"),
     (["mac os", "macos", "os x"],                                   "laptop"),
@@ -2187,6 +2259,7 @@ async def _fingerbank_loop():
                         device.fingerbank_result = result
                         from sqlalchemy.orm.attributes import flag_modified
                         flag_modified(device, "fingerbank_result")
+                        _apply_fingerbank_enrichment(device, result)
                         db.commit()
                         await asyncio.sleep(0.5)
             finally:
@@ -2426,6 +2499,18 @@ async def on_startup():
     asyncio.ensure_future(_fingerbank_loop())
     asyncio.ensure_future(_plugin_scheduler.run())
     asyncio.ensure_future(_auto_update_schedule_loop())
+    _cu.init(
+        session_local        = SessionLocal,
+        get_enabled_hosts    = _get_enabled_hosts,
+        make_docker_client   = _make_docker_client,
+        fmt_container        = _fmt_container,
+        add_host_meta        = _add_docker_host_meta,
+        gen_compose_yaml     = _generate_compose_yaml,
+        parse_proxmox_id     = _parse_proxmox_id,
+        notification_dispatch = _notification_dispatch,
+        main_loop_getter     = lambda: _main_loop,
+    )
+    asyncio.ensure_future(_cu.container_update_check_loop())
 
 
 @app.get("/events/stream")
@@ -2574,6 +2659,10 @@ class SetupCompleteRequest(BaseModel):
     notifications_enabled: bool  = True
     ntfy_topic:           str    = ""
     ntfy_url:             str    = "https://ntfy.sh"
+    gotify_url:           str    = ""
+    gotify_token:         str    = ""
+    pushbullet_api_key:   str    = ""
+    alert_webhook_url:    str    = ""
     docker_enabled:       bool   = False
     docker_host:          str    = "unix:///var/run/docker.sock"
     fingerbank_api_key:   str    = ""
@@ -2737,6 +2826,46 @@ def _infer_vendor(d: Device) -> str | None:
         if tok and len(tok) > 2:
             return tok
     return None
+
+
+def _apply_fingerbank_enrichment(d: Device, result: dict | None) -> None:
+    """
+    Persist conservative identity hints from Fingerbank when local identity is missing.
+    Never overrides explicit user identity overrides.
+    """
+    if not result or result.get("error"):
+        return
+
+    score = result.get("score") or 0
+    if score < 50:
+        return
+
+    # Fill vendor from Fingerbank only when no existing vendor is known.
+    current_vendor = (getattr(d, "vendor", None) or "").strip()
+    if not getattr(d, "vendor_override", None) and (not current_vendor or current_vendor.lower() == "unknown"):
+        inferred_vendor = _infer_vendor(d)
+        if inferred_vendor:
+            d.vendor = inferred_vendor
+
+    # Persist inferred type into scan_results for consistency with existing UI paths.
+    if not getattr(d, "device_type_override", None):
+        mapped_type = result.get("mapped_type")
+        if mapped_type:
+            scan = dict(d.scan_results or {})
+            current_type = (scan.get("device_type") or "").strip().lower()
+            current_source = (scan.get("device_type_source") or "").strip().lower()
+            should_set = (
+                not current_type
+                or current_type == "unknown"
+                or current_source in ("", "heuristic", "dhcp")
+            )
+            if should_set:
+                scan["device_type"] = mapped_type
+                scan["device_type_source"] = "fingerbank"
+                scan["device_type_conf"] = round(min(float(score), 100.0) / 100.0, 2)
+                d.scan_results = scan
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(d, "scan_results")
 
 
 # ---------------------------------------------------------------------------
@@ -3202,6 +3331,41 @@ def setup_complete(
         else:
             db.add(Setting(key=key, value=value))
     db.commit()
+
+    # Write notification channel directly to notification_channels so it appears
+    # in the Notifications settings panel immediately without requiring a restart.
+    # Build list of (service, display_name, config_dict) tuples from wizard input.
+    new_channels = []
+    if payload.ntfy_topic.strip():
+        new_channels.append(("ntfy", "ntfy", {
+            "server": (payload.ntfy_url or "https://ntfy.sh").strip(),
+            "topic":  payload.ntfy_topic.strip(),
+        }))
+    if payload.gotify_url.strip() and payload.gotify_token.strip():
+        new_channels.append(("gotify", "Gotify", {
+            "server": payload.gotify_url.strip(),
+            "token":  payload.gotify_token.strip(),
+        }))
+    if payload.pushbullet_api_key.strip():
+        new_channels.append(("pushbullet", "Pushbullet", {
+            "api_key": payload.pushbullet_api_key.strip(),
+        }))
+    if payload.alert_webhook_url.strip():
+        new_channels.append(("webhook", "Webhook", {
+            "url": payload.alert_webhook_url.strip(),
+        }))
+
+    for svc, name, cfg in new_channels:
+        # Replace any existing channel of the same service type so re-running
+        # the wizard doesn't create duplicates.
+        db.execute(text("DELETE FROM notification_channels WHERE service = :s"), {"s": svc})
+        db.execute(
+            text("INSERT INTO notification_channels (name, service, config, enabled) VALUES (:n, :s, :c, true)"),
+            {"n": name, "s": svc, "c": json.dumps(cfg)},
+        )
+    if new_channels:
+        db.commit()
+
     return {"ok": True, "setup_complete": True}
 
 
@@ -3431,6 +3595,29 @@ def list_devices(
     return result
 
 
+@app.get("/devices/ip-management")
+def get_ip_management(db: Session = Depends(get_db)):
+    devices = db.query(Device).order_by(Device.last_seen.desc()).all()
+    history_rows = db.execute(
+        text("SELECT mac_address, ip_address, first_seen, last_seen, seen_while_online FROM ip_history ORDER BY mac_address, last_seen DESC")
+    ).fetchall()
+    ip_map: dict = {}
+    for r in history_rows:
+        ip_map.setdefault(r[0], []).append({
+            "ip":              r[1],
+            "first_seen":      r[2].isoformat() if r[2] else None,
+            "last_seen":       r[3].isoformat() if r[3] else None,
+            "seen_while_online": bool(r[4]),
+        })
+    result = []
+    for d in devices:
+        dct = _to_dict(d)
+        dct["effective_ip"] = getattr(d, "primary_ip", None) or d.ip_address
+        dct["ips"] = ip_map.get(d.mac_address, [])
+        result.append(dct)
+    return result
+
+
 @app.get("/devices/{mac}")
 def get_device(mac: str, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
@@ -3637,6 +3824,7 @@ async def fingerbank_lookup(mac: str, db: Session = Depends(get_db)):
     device.fingerbank_result = result
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(device, "fingerbank_result")
+    _apply_fingerbank_enrichment(device, result)
     db.commit()
     return {"result": result, "device": _to_dict(device)}
 
@@ -3678,6 +3866,33 @@ def get_ip_history(mac: str, db: Session = Depends(get_db)):
         return []
 
 
+@app.get("/export/ips-csv")
+def export_ips_csv(db: Session = Depends(get_db)):
+    """Export all IP history as CSV."""
+    import io, csv
+    rows = db.execute(text("""
+        SELECT d.mac_address, COALESCE(d.custom_name, d.hostname, d.ip_address) AS name,
+               h.ip_address, h.first_seen, h.last_seen, h.seen_while_online,
+               d.primary_ip, d.primary_ip_locked, d.is_online
+        FROM ip_history h
+        JOIN devices d ON d.mac_address = h.mac_address
+        ORDER BY d.mac_address, h.last_seen DESC
+    """)).fetchall()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["mac_address", "device_name", "ip_address", "first_seen", "last_seen", "seen_while_online", "primary_ip", "primary_ip_locked", "is_online"])
+    for r in rows:
+        w.writerow([r[0], r[1], r[2],
+                    r[3].isoformat() if r[3] else "",
+                    r[4].isoformat() if r[4] else "",
+                    r[5], r[6], r[7], r[8]])
+
+    from fastapi.responses import StreamingResponse as _SR
+    return _SR(iter([buf.getvalue()]), media_type="text/csv",
+               headers={"Content-Disposition": "attachment; filename=inspectre-ip-management.csv"})
+
+
 @app.post("/devices/{mac}/set-primary-ip")
 async def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depends(get_db)):
     d = db.get(Device, mac.lower())
@@ -3695,15 +3910,43 @@ async def set_primary_ip(mac: str, payload: PrimaryIPUpdate, db: Session = Depen
     if not row and d.ip_address != target_ip:
         raise HTTPException(404, "IP not found in device history")
 
-    old_primary = getattr(d, 'primary_ip', None) or d.ip_address
-    d.primary_ip = target_ip
-    d.primary_ip_locked = True
-    d.ip_address = target_ip
-    d.deep_scanned = False
-    d.scan_results = None
+    old_primary = d.primary_ip or d.ip_address
+
+    # The probe installs a BEFORE UPDATE trigger that reverts primary_ip/ip_address
+    # when both OLD.primary_ip_locked AND NEW.primary_ip_locked are TRUE — to stop
+    # the probe overwriting a user pin.  Re-pinning an already-locked device hits
+    # that condition.  Work around it with two updates in the same transaction:
+    #   1. Unlock (OLD=T→NEW=F): trigger condition False, write succeeds.
+    #   2. Re-pin (OLD=F→NEW=T): trigger condition False, write succeeds.
+    # Both updates are invisible outside this transaction so no race with the probe.
+    db.execute(
+        text("UPDATE devices SET primary_ip_locked = FALSE WHERE mac_address = :mac"),
+        {"mac": mac.lower()},
+    )
+    db.execute(
+        text("""UPDATE devices
+                   SET primary_ip   = :ip,
+                       ip_address   = :ip,
+                       primary_ip_locked = TRUE,
+                       deep_scanned = FALSE,
+                       scan_results = NULL
+                 WHERE mac_address  = :mac"""),
+        {"ip": target_ip, "mac": mac.lower()},
+    )
     _add_event(db, mac.lower(), 'primary_ip_changed', {'old_primary_ip': old_primary, 'new_primary_ip': target_ip})
     db.commit()
     db.refresh(d)
+
+    # Verify the pin was written correctly — the DB trigger or a concurrent
+    # update could silently prevent it.
+    if d.primary_ip != target_ip or not d.primary_ip_locked:
+        print(
+            f"[set-primary-ip] WARN: pin verification failed for {mac}: "
+            f"expected primary={target_ip} locked=True, "
+            f"got primary={d.primary_ip} locked={d.primary_ip_locked}",
+            flush=True,
+        )
+        raise HTTPException(500, "Pin did not take effect — the device may have a conflicting lock. Please try again.")
 
     result = {"ok": True, "device": _to_dict(d)}
 
@@ -8434,6 +8677,16 @@ def _get_docker_host(db: Session) -> str:
     s = db.get(Setting, "docker_host")
     return (s.value if s else None) or "unix:///var/run/docker.sock"
 
+def _parse_extra_hosts(extra_hosts):
+    """Docker stores ExtraHosts as ['host:ip', ...]; the SDK wants {host: ip}."""
+    out = {}
+    for item in (extra_hosts or []):
+        if ":" in item:
+            host, ip = item.rsplit(":", 1)
+            out[host] = ip
+    return out or None
+
+
 def _make_docker_client(host: str):
     try:
         import docker as _docker
@@ -8783,20 +9036,42 @@ async def docker_update(container_id: str, db: Session = Depends(get_db)):
         client = _make_docker_client(host_url)
         try:
             c = client.containers.get(container_id)
-            # Store current container config before deletion
-            image_name = c.image.tags[0] if c.image.tags else str(c.image.id)
-            
-            # Pull latest image
-            try:
-                client.images.pull(image_name)
-            except Exception as pull_err:
-                # If pull fails, continue anyway - might use cached image
-                pass
-            
-            # Get current container config
             attrs = c.attrs or {}
             config = attrs.get("Config", {})
             host_cfg = attrs.get("HostConfig", {})
+            
+            # Use the original image reference from the container config (not digest)
+            image_name = config.get("Image", "")
+            if not image_name:
+                raise Exception("Could not determine container image reference")
+            
+            # Pull latest image with 5-minute timeout
+            try:
+                import signal
+                def _timeout_handler(signum, frame):
+                    raise TimeoutError("Image pull timed out after 5 minutes")
+                
+                old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+                signal.alarm(300)  # 5 minutes
+                try:
+                    client.images.pull(image_name)
+                finally:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+            except (TimeoutError, Exception) as pull_err:
+                raise Exception(f"Failed to pull image '{image_name}': {pull_err}")
+            
+            # Preserve network attachments + aliases for user-defined networks
+            networks_to_attach = {}
+            net_settings = attrs.get("NetworkSettings", {}) or {}
+            networks = (net_settings.get("Networks") or {})
+            if networks:
+                ordered_nets = list(networks.items())
+                if ordered_nets:
+                    first_name, first_info = ordered_nets[0]
+                    first_aliases = [a for a in (first_info.get("Aliases") or []) if a]
+                    if first_name not in ("bridge", "host", "none"):
+                        networks_to_attach[first_name] = first_aliases
             
             # Stop container
             if c.status != "exited":
@@ -8805,35 +9080,88 @@ async def docker_update(container_id: str, db: Session = Depends(get_db)):
             # Remove old container
             c.remove(force=True)
             
-            # Create new container with same config
-            new_c = client.containers.create(
-                image=image_name,
-                command=config.get("Cmd"),
-                environment=config.get("Env"),
-                labels=config.get("Labels"),
-                hostname=config.get("Hostname"),
-                working_dir=config.get("WorkingDir"),
-                name=c.name.lstrip("/"),
-                ports=None,  # Will be handled by port bindings in host_config
-                volumes=None,  # Will be handled by binds in host_config
-                restart_policy={"Name": host_cfg.get("RestartPolicy", {}).get("Name", "no")},
-                host_config=client.api.create_host_config(
-                    port_bindings={
-                        p.split("/")[0]: int(b.get("HostPort", 0)) 
-                        for p, bindings in (attrs.get("NetworkSettings", {}).get("Ports") or {}).items()
-                        if bindings
-                        for b in bindings
-                    },
-                    binds={
-                        m.get("Source", ""): {"bind": m.get("Destination", ""), "mode": m.get("Mode", "rw")}
-                        for m in (attrs.get("Mounts") or [])
-                        if m.get("Type") == "bind"
-                    },
-                ),
+            # Parse port bindings correctly from HostConfig
+            port_bindings = None
+            pb = host_cfg.get("PortBindings") or {}
+            if pb:
+                port_bindings = {}
+                for cport, binds in pb.items():
+                    if binds:
+                        hostport = binds[0].get("HostPort")
+                        hostip = binds[0].get("HostIp") or ""
+                        if hostport:
+                            port_bindings[cport] = (hostip, int(hostport)) if hostip else int(hostport)
+                    else:
+                        port_bindings[cport] = None
+            
+            # Parse devices if any
+            devices = []
+            for d in (host_cfg.get("Devices") or []):
+                devices.append(
+                    f"{d.get('PathOnHost')}:{d.get('PathInContainer')}:{d.get('CgroupPermissions', 'rwm')}"
+                )
+            
+            # Get restart policy
+            restart = host_cfg.get("RestartPolicy") or {}
+            restart_policy = None
+            if restart.get("Name"):
+                restart_policy = {
+                    "Name": restart.get("Name"),
+                    "MaximumRetryCount": restart.get("MaximumRetryCount", 0),
+                }
+            
+            # Build host config
+            host_config = client.api.create_host_config(
+                binds=host_cfg.get("Binds") or None,
+                port_bindings=port_bindings,
+                privileged=bool(host_cfg.get("Privileged")),
+                cap_add=host_cfg.get("CapAdd") or None,
+                cap_drop=host_cfg.get("CapDrop") or None,
+                extra_hosts=_parse_extra_hosts(host_cfg.get("ExtraHosts")),
+                restart_policy=restart_policy,
+                network_mode=host_cfg.get("NetworkMode") or "bridge",
+                devices=devices or None,
             )
             
+            # Exposed ports
+            exposed = list((config.get("ExposedPorts") or {}).keys()) or None
+            
+            # Create networking config for first network
+            networking_config = None
+            if networks_to_attach:
+                first_net_name = list(networks_to_attach.keys())[0]
+                first_net_aliases = networks_to_attach[first_net_name]
+                networking_config = client.api.create_networking_config(
+                    {first_net_name: client.api.create_endpoint_config(aliases=first_net_aliases)}
+                )
+            
+            # Create new container
+            new_c = client.containers.create(
+                image=image_name,
+                name=c.name.lstrip("/"),
+                command=config.get("Cmd"),
+                entrypoint=config.get("Entrypoint"),
+                environment=config.get("Env"),
+                labels=config.get("Labels"),
+                hostname=None if host_cfg.get("NetworkMode") in ("host", "none") else config.get("Hostname"),
+                working_dir=config.get("WorkingDir") or None,
+                ports=exposed,
+                host_config=host_config,
+                networking_config=networking_config,
+            )
+            
+            # Attach additional networks (skip first, already attached)
+            if len(networks_to_attach) > 1:
+                for i, (net_name, aliases) in enumerate(list(networks_to_attach.items())[1:]):
+                    try:
+                        client.api.connect_container_to_network(
+                            new_c.id, net_name, aliases=aliases
+                        )
+                    except Exception:
+                        pass
+            
             # Start new container
-            new_c.start()
+            client.api.start(new_c.id)
             new_c.reload()
             return _add_docker_host_meta(_fmt_container(new_c), docker_hosts[0], host_url)
         finally:
@@ -8856,6 +9184,19 @@ async def stream_docker_logs(container_id: str, tail: int = 100, db: Session = D
         raise HTTPException(503, "No container hosts configured.")
     docker_hosts = [h for h in _get_enabled_hosts(db) if h["type"] != "proxmox"]
     host = docker_hosts[0]["url"] if docker_hosts else _get_docker_host(db)
+
+    def _ensure_exists():
+        client = _make_docker_client(host)
+        try:
+            client.containers.get(container_id)
+        finally:
+            client.close()
+
+    try:
+        await asyncio.to_thread(_ensure_exists)
+    except Exception as e:
+        code = 404 if "404" in str(e) or "Not Found" in str(e) else 503
+        raise HTTPException(code, str(e))
 
     line_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
@@ -9039,8 +9380,19 @@ def _generate_compose_yaml(c) -> tuple[str, dict]:
     net_names   = list(networks.keys())
     _std_nets   = {"bridge", "host", "none"}
     custom_nets = [n for n in net_names if n not in _std_nets]
-    if "host" in net_names:
+    _hc_net_mode = (hcfg.get("NetworkMode") or "").lower()
+    if _hc_net_mode == "host" or "host" in net_names:
         svc["network_mode"] = "host"
+    elif _hc_net_mode == "none":
+        svc["network_mode"] = "none"
+    elif _hc_net_mode.startswith("container:"):
+        _parent_ref = hcfg["NetworkMode"].split(":", 1)[1]
+        try:
+            _parent = c.client.containers.get(_parent_ref)
+            _parent_name = _parent.name.lstrip("/")
+        except Exception:
+            _parent_name = _parent_ref  # fall back to raw ID/name
+        svc["network_mode"] = f"container:{_parent_name}"
     elif custom_nets:
         net_block = {}
         for n in custom_nets:

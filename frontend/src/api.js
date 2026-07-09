@@ -65,6 +65,33 @@ async function streamSSE(path, onLine, signal) {
   }
 }
 
+async function streamSSEPost(path, body, onLine, signal) {
+  const token   = getToken()
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST', headers, body: JSON.stringify(body), signal,
+  })
+  if (!res.ok) throw new Error(`POST ${path} \u2192 ${res.status}`)
+  const reader  = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    const parts = buf.split('\n')
+    buf = parts.pop()
+    for (const part of parts) {
+      const line = part.trim()
+      if (line.startsWith('data:')) {
+        const text = line.slice(5).trim()
+        if (text) onLine(text)
+      }
+    }
+  }
+}
+
 export const api = {
   // Health / status
   getHealth: () => {
@@ -116,6 +143,11 @@ export const api = {
   getIpHistory:    (mac)        => request('GET',   `/devices/${mac}/ip-history`),
   setPrimaryIp:    (mac, ip)    => request('POST',  `/devices/${mac}/set-primary-ip`, { ip_address: ip }),
   unpinPrimaryIp:  (mac)        => request('POST',  `/devices/${mac}/unpin-ip`),
+  getIpManagement: ()           => request('GET',   '/devices/ip-management'),
+  exportIpsCsv: () => {
+    const token = getToken()
+    return fetch(`${BASE}/export/ips-csv`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  },
   getDeviceEvents: (mac, limit, type) => {
     const p = new URLSearchParams()
     if (limit) p.set('limit', limit)
@@ -351,6 +383,21 @@ export const api = {
   dockerVulnSummary:      ()          => request('GET',  '/docker/vuln-summary'),
   dockerScanAll:          ()          => request('POST', '/docker/scan-all'),
   getContainerTimeline:   (days)      => request('GET',  `/docker/timeline?days=${days}`),
+
+  // Container update management
+  dockerUpdateStatus:       ()                       => request('GET',  '/docker/update-status'),
+  dockerContainerUpdateStatus: (id)                  => request('GET',  `/docker/containers/${id}/update-status`),
+  dockerCheckUpdate:        (id)                     => request('POST', `/docker/containers/${id}/check-update`),
+  dockerScanNewImage:       (id, onLine, signal)     => streamSSEPost(`/docker/containers/${id}/scan-new-image`, {}, onLine, signal),
+  dockerSafeUpdate:         (id, body, onLine, signal) => streamSSEPost(`/docker/containers/${id}/safe-update`, body, onLine, signal),
+  dockerBackupContainer:    (id)                     => request('POST', `/docker/containers/${id}/backup`),
+  dockerListBackups:        (id)                     => request('GET',  `/docker/containers/${id}/backups`),
+  dockerGetBackupCompose:   (bid)                    => request('GET',  `/docker/backups/${bid}/compose`),
+  dockerPinContainer:       (id, pinned)             => request('POST', `/docker/containers/${id}/pin`, { pinned }),
+  dockerCheckAllUpdates:    ()                       => request('POST', '/docker/check-all-updates'),
+  dockerCheckAllStatus:     ()                       => request('GET',  '/docker/check-all-status'),
+  dockerUpdateAll:          ()                       => request('POST', '/docker/update-all'),
+  ping:                     ()                       => fetch('/api/ping').then(r => r.ok),
 
   // Container host management (multi-host: Docker + Proxmox)
   listContainerHosts:     ()          => request('GET',    '/container-hosts'),

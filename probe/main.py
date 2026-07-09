@@ -541,41 +541,43 @@ def init_db() -> None:
         conn.commit()
 
         # ── Hard pin enforcement (DB-level) ─────────────────────────────────
-        # A user-pinned primary IP must be absolutely immutable from automatic
-        # writers (the ARP sweep, the passive sniffer, reconnect handling, etc.).
-        # Python/SQL-level guards in upsert_seen_device lose races against the
-        # backend pin commit and stale ORM snapshots, so we enforce the lock at
-        # the database itself with a BEFORE UPDATE trigger. While a row stays
-        # locked, neither primary_ip nor ip_address can change. Legitimate user
-        # actions (pin to a new IP, unpin) run through the backend, which sets a
-        # transaction-local GUC to bypass the trigger.
+        # When primary_ip_locked=TRUE, the probe and sniffer must never
+        # overwrite primary_ip or ip_address.  The CASE expressions in
+        # upsert_seen_device are the primary guard; this trigger is the backstop
+        # that survives any Python-side race or unexpected code path.
+        #
+        # Trigger fires whenever OLD.primary_ip_locked=TRUE (regardless of NEW):
+        # it unconditionally restores primary_ip and ip_address from OLD.
+        # The backend's two-step re-pin bypasses this correctly:
+        #   Step 1 — SET locked=FALSE: trigger fires but primary_ip isn't being
+        #            changed (NEW.primary_ip == OLD.primary_ip), no visible effect.
+        #   Step 2 — SET primary_ip=X, locked=TRUE: OLD.locked=FALSE so trigger
+        #            doesn't fire and the new pin is written normally.
         try:
             conn.execute(text("""
-                CREATE OR REPLACE FUNCTION enforce_primary_ip_lock()
-                RETURNS trigger AS $$
+                CREATE OR REPLACE FUNCTION enforce_primary_ip_lock() RETURNS trigger AS $$
                 BEGIN
-                    IF COALESCE(current_setting('inspectre.bypass_ip_lock', true), '') = 'on' THEN
-                        RETURN NEW;
-                    END IF;
-                    IF OLD.primary_ip_locked AND NEW.primary_ip_locked THEN
+                    IF OLD.primary_ip_locked THEN
                         NEW.primary_ip := OLD.primary_ip;
-                        NEW.ip_address := OLD.primary_ip;
+                        NEW.ip_address := OLD.ip_address;
                     END IF;
                     RETURN NEW;
                 END;
-                $$ LANGUAGE plpgsql;
+                $$ LANGUAGE plpgsql
             """))
-            conn.execute(text("DROP TRIGGER IF EXISTS trg_enforce_primary_ip_lock ON devices"))
+            conn.execute(text("""
+                DROP TRIGGER IF EXISTS trg_enforce_primary_ip_lock ON devices
+            """))
             conn.execute(text("""
                 CREATE TRIGGER trg_enforce_primary_ip_lock
                     BEFORE UPDATE ON devices
                     FOR EACH ROW
-                    EXECUTE FUNCTION enforce_primary_ip_lock();
+                    EXECUTE FUNCTION enforce_primary_ip_lock()
             """))
             conn.commit()
-            print("[DB] Primary-IP lock trigger installed.", flush=True)
+            print("[DB] primary_ip_lock trigger installed.", flush=True)
         except Exception as e:
-            print(f"[DB] Pin-lock trigger note: {e}", flush=True)
+            print(f"[DB] Trigger install error: {e}", flush=True)
             conn.rollback()
 
     print("[DB] Migrations complete.", flush=True)
@@ -1711,14 +1713,15 @@ _host_ips_lock = threading.Lock()
 
 def _get_host_ipv4s(ttl: int = 120) -> set:
     """
-    IPv4 addresses bound to the probe host's own interfaces (cached `ttl`s).
+    IPv4 addresses bound to the probe's active scanning interface only (cached `ttl`s).
 
-    The probe runs in the host network namespace, so these are the Docker host's
-    own addresses (its primary NIC, macvlan shims, bridges, etc.). A host never
-    answers ARP for its own IPs the way a remote device does, so such devices can
-    never be confirmed "online" via the ARP sweep — yet they are, by definition,
-    always reachable. Presence treats any device holding one of these IPs as
-    online, which fixes the "host shows offline but pings fine" case.
+    Scoped intentionally to INTERFACE (the LAN-facing NIC) rather than every
+    interface on the host.  Scanning all interfaces would include Docker bridge
+    addresses (docker0, br-xxx, compose networks, macvlan shims, VPN tuns, etc.)
+    which can overlap with real LAN device IPs and falsely pin those devices online.
+
+    The only address that genuinely can't be ARP-confirmed is the host's own IP
+    on the interface the probe sweeps — that's all we need to protect.
     """
     global _host_ips_cache
     now = time.time()
@@ -1728,20 +1731,18 @@ def _get_host_ipv4s(ttl: int = 120) -> set:
             return cached
     ips: set = set()
     try:
-        from scapy.all import get_if_list, get_if_addr
-        for iface in get_if_list():
-            try:
-                a = get_if_addr(iface)
-                if a and a != "0.0.0.0" and _is_valid_ip(a):
-                    ips.add(a)
-            except Exception:
-                continue
+        from scapy.all import get_if_addr
+        a = get_if_addr(INTERFACE)
+        if a and a != "0.0.0.0" and _is_valid_ip(a):
+            ips.add(a)
     except Exception:
         pass
     if not ips:
         try:
-            out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
-                                 capture_output=True, text=True, timeout=5).stdout
+            out = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show", "dev", INTERFACE],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
             for line in out.splitlines():
                 parts = line.split()
                 for i, tok in enumerate(parts):
@@ -2071,7 +2072,10 @@ def upsert_seen_device(mac: str, ip: str, source: str) -> None:
                     .on_conflict_do_update(
                         index_elements=["mac_address"],
                         set_=dict(
-                            ip_address = ip,
+                            ip_address = text(
+                                "CASE WHEN devices.primary_ip_locked "
+                                "THEN devices.primary_ip ELSE :new_ip END"
+                            ).bindparams(new_ip=ip),
                             primary_ip = text(_new_primary_ip_case),
                             is_online  = True,
                             last_seen  = text("CASE WHEN devices.is_online = false THEN NOW() ELSE devices.last_seen END"),
