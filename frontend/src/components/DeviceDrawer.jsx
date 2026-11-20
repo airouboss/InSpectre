@@ -579,6 +579,20 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
   const scan = localDevice.scan_results
   const mac  = localDevice.mac_address
 
+  useEffect(() => {
+    let cancelled = false
+    if (!mac) return () => {}
+    api.getDevice(mac).then(detailed => {
+      if (!cancelled) setLocalDevice(prev => {
+        // Preserve presence-state fields from the parent's live-polled data so
+        // the drawer's one-shot fetch doesn't overwrite the freshest known state.
+        const { is_online, status_changed_at, last_seen } = prev || {}
+        return { ...(prev || {}), ...detailed, is_online, status_changed_at, last_seen }
+      })
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [mac])
+
   const vulnSev    = localDevice.vuln_severity
   const vulnSevCfg = vulnSev && vulnSev !== 'clean' ? {
     critical: '#ef4444', high: '#f97316', medium: '#f59e0b', low: '#3b82f6', info: '#8b5cf6'
@@ -620,7 +634,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
       const updated = localDevice.is_blocked
         ? await api.unblockDevice(mac)
         : await api.blockDevice(mac)
-      setLocalDevice(updated)
+      setLocalDevice(prev => ({ ...prev, ...updated }))
       if (onRefresh) onRefresh()
       setStaticLines([
         action === 'block'
@@ -645,7 +659,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     setLocalDevice(prev => ({ ...prev, is_ignored: newVal }))
     try {
       const updated = await api.updateMetadata(mac, { is_ignored: newVal })
-      setLocalDevice(updated)
+      setLocalDevice(prev => ({ ...prev, ...updated }))
       if (onRefresh) onRefresh()
     } catch {
       setLocalDevice(prev => ({ ...prev, is_ignored: !newVal }))
@@ -660,7 +674,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
     setLocalDevice(prev => ({ ...prev, suppress_presence_events: newVal }))
     try {
       const updated = await api.updateMetadata(mac, { suppress_presence_events: newVal })
-      setLocalDevice(updated)
+      setLocalDevice(prev => ({ ...prev, ...updated }))
       if (onRefresh) onRefresh()
     } catch {
       setLocalDevice(prev => ({ ...prev, suppress_presence_events: !newVal }))
@@ -715,8 +729,8 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
           </div>
         </div>
 
-        {/* Tab bar */}
-        <div className="flex border-b border-border px-4 gap-0 overflow-x-auto scrollbar-none" style={{ background: 'var(--color-surface)' }}>
+        {/* Tab bar — 5-col grid on mobile, single scrolling row on sm+ */}
+        <div className="grid grid-cols-5 sm:flex border-b border-border sm:overflow-x-auto sm:scrollbar-none" style={{ background: 'var(--color-surface)' }}>
           {TABS.map(tab => {
             const isVuln   = tab.id === 'vulns'
             const isActive = activeTab === tab.id
@@ -724,7 +738,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className="px-3 py-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                className="px-1 py-2.5 sm:px-3 sm:py-3 text-xs font-medium border-b-2 transition-colors flex items-center justify-center gap-1 sm:whitespace-nowrap sm:shrink-0"
                 style={isActive
                   ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
                   : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}
@@ -739,7 +753,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+        <div className="flex-1 overflow-y-auto px-6 py-5 pb-16 space-y-6">
 
           {activeTab === 'overview' && (
             <>
@@ -1006,7 +1020,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               {/* Timeline summary */}
               <Collapsible title="Timeline" icon={Clock} defaultOpen={true}>
                 <Row label="First seen"    value={fmt(localDevice.first_seen)} />
-                <Row label="Last changed" value={fmt(localDevice.last_seen)} />
+                <Row label="Last changed" value={fmt(localDevice.status_changed_at || localDevice.first_seen || localDevice.last_seen)} />
                 {scan?.scanned_at && <Row label="Scanned at" value={fmt(scan.scanned_at)} />}
               </Collapsible>
 
@@ -1103,7 +1117,7 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
               setScanning={setVulnScanning}
               onScanComplete={() => {
                 api.getDevice(mac).then(updated => {
-                  setLocalDevice(updated)
+                  setLocalDevice(prev => ({ ...prev, ...updated }))
                   if (onRefresh) onRefresh()
                 }).catch(() => {})
               }}
@@ -1140,7 +1154,17 @@ export function DeviceDrawer({ device, onClose, onRename, onResolveName, onRefre
                 <IdentityForm
                   device={localDevice}
                   onSaved={updated => {
-                    setLocalDevice(updated)
+                    setLocalDevice(prev => ({ ...prev, ...updated }))
+                    if (onRefresh) onRefresh()
+                  }}
+                />
+              </Collapsible>
+
+              <Collapsible title="Known Names" icon={Globe} defaultOpen={true}>
+                <NameSourceManager
+                  device={localDevice}
+                  onSaved={updated => {
+                    setLocalDevice(prev => ({ ...prev, ...updated }))
                     if (onRefresh) onRefresh()
                   }}
                 />
@@ -1424,6 +1448,93 @@ function Row({ label, value, mono }) {
       <span className={`text-sm text-text text-right truncate ${mono ? 'font-mono text-xs' : ''}`}>
         {value ?? '--'}
       </span>
+    </div>
+  )
+}
+
+function NameSourceManager({ device, onSaved }) {
+  const [savingKey, setSavingKey] = useState(null)
+  const [error, setError] = useState(null)
+  const candidates = Array.isArray(device.name_candidates) ? device.name_candidates : []
+
+  async function pinName(value) {
+    const key = value || '__auto__'
+    setSavingKey(key)
+    setError(null)
+    try {
+      const updated = await api.updateDevice(device.mac_address, { custom_name: value || '' })
+      onSaved?.(updated)
+    } catch (e) {
+      setError(e.message || 'Save failed')
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-muted)' }}>
+        Choose which discovered name should be pinned. Pinning uses the device's custom name, so
+        automatic hostname updates stop changing the display name until you switch back to auto.
+      </p>
+
+      {device.custom_name && (
+        <button
+          type="button"
+          disabled={savingKey !== null}
+          onClick={() => pinName(null)}
+          className="text-[11px] px-2 py-1 rounded-lg border font-medium transition-colors disabled:opacity-50"
+          style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+        >
+          {savingKey === '__auto__' ? 'Switching…' : 'Use automatic best name'}
+        </button>
+      )}
+
+      {candidates.length === 0 ? (
+        <p className="text-xs italic" style={{ color: 'var(--color-text-faint)' }}>
+          No discovered hostname candidates yet. Try a hostname refresh, DHCP renewal, mDNS scan, or plugin poll.
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {candidates.map((cand, idx) => {
+            const busy = savingKey === cand.value
+            return (
+              <div key={`${cand.source}-${cand.value}-${idx}`} className="rounded-lg border px-3 py-2 space-y-1"
+                style={{ borderColor: 'var(--color-border)', background: 'var(--color-surface-offset)' }}>
+                <div className="flex items-start gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium truncate" style={{ color: 'var(--color-text)' }}>{cand.value}</div>
+                    <div className="text-[11px]" style={{ color: 'var(--color-text-faint)' }}>{cand.source_label}</div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
+                    {cand.is_current && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold"
+                        style={{ background: 'rgba(34,197,94,0.15)', color: '#22c55e' }}>Current</span>
+                    )}
+                    {cand.is_pinned && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold"
+                        style={{ background: 'var(--color-brand-alpha)', color: 'var(--color-brand)' }}>Pinned</span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    disabled={savingKey !== null || cand.is_pinned}
+                    onClick={() => pinName(cand.value)}
+                    className="text-[11px] px-2 py-1 rounded-lg border font-medium transition-colors disabled:opacity-50"
+                    style={{ borderColor: 'var(--color-brand)', color: 'var(--color-brand)', background: 'var(--color-brand-alpha)' }}
+                  >
+                    {cand.is_pinned ? 'Pinned' : busy ? 'Pinning…' : 'Pin this name'}
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {error && <p className="text-xs text-red-400">{error}</p>}
     </div>
   )
 }

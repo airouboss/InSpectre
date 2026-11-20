@@ -35,6 +35,7 @@ from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy import text
+from trivy_utils import run_trivy_image_scan_sync
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 # Replicated from main.py to avoid circular imports — only needs env vars.
@@ -161,10 +162,14 @@ def _extract_ports_from_network_settings(net_ports: dict | None) -> tuple[dict, 
     exposed_ports: list = []
 
     for port_proto, bindings in (net_ports or {}).items():
+        # Bug 2: skip phantom /0 protocol entries created by Docker on recreation
+        if port_proto.endswith("/0"):
+            continue
         exposed_ports.append(port_proto)
         if not bindings:
             continue
 
+        seen_host_ports: set = set()
         mapped = []
         for b in bindings:
             hp = b.get("HostPort")
@@ -174,7 +179,15 @@ def _extract_ports_from_network_settings(net_ports: dict | None) -> tuple[dict, 
                 host_port = int(hp)
             except Exception:
                 host_port = hp
-            host_ip = b.get("HostIp")
+            # Bug 3: normalize 0.0.0.0 and :: to empty string (all-interfaces)
+            host_ip = b.get("HostIp") or ""
+            if host_ip in ("0.0.0.0", "::"):
+                host_ip = ""
+            # Bug 1: deduplicate IPv4/IPv6 bindings for the same host port
+            dedup_key = (host_ip, host_port)
+            if dedup_key in seen_host_ports:
+                continue
+            seen_host_ports.add(dedup_key)
             mapped.append((host_ip, host_port) if host_ip else host_port)
 
         if len(mapped) == 1:
@@ -313,28 +326,14 @@ try:
     net_cfg = attrs.get("NetworkSettings", {})
     all_nets = list((net_cfg.get("Networks") or {}).keys())
 
-    # Port bindings + exposed ports
-    port_bindings = {}
-    exposed_ports = []
-    for port_proto, bindings in (net_cfg.get("Ports") or {}).items():
-        exposed_ports.append(port_proto)
-        if not bindings:
-            continue
-        mapped = []
-        for b in bindings:
-            hp = b.get("HostPort")
-            if not hp:
-                continue
-            try:
-                host_port = int(hp)
-            except Exception:
-                host_port = hp
-            host_ip = b.get("HostIp")
-            mapped.append((host_ip, host_port) if host_ip else host_port)
-        if len(mapped) == 1:
-            port_bindings[port_proto] = mapped[0]
-        elif mapped:
-            port_bindings[port_proto] = mapped
+    # Port bindings + exposed ports.
+    # HostConfig.PortBindings is the authoritative config-time source and is
+    # never cleared by Docker when a container stops. NetworkSettings.Ports is
+    # only populated while the container is running, so it is empty here since
+    # we stopped the container before reading attrs.
+    port_bindings, exposed_ports = _extract_ports_from_network_settings(
+        hcfg.get("PortBindings") or net_cfg.get("Ports")
+    )
 
     # Bind mounts + named volumes
     binds = {}
@@ -373,6 +372,9 @@ try:
         None if _host_mode in ("host", "none") or _host_mode.startswith("container:")
         else (config.get("Hostname") or TARGET_NAME)
     )
+    # host/none/container: network modes don't support port bindings
+    if _host_mode in ("host", "none") or _host_mode.startswith("container:"):
+        port_bindings, exposed_ports = None, []
     _result = client.api.create_container(
         image          = NEW_IMAGE,
         name           = TARGET_NAME,
@@ -392,6 +394,7 @@ try:
             volumes_from  = hcfg.get("VolumesFrom") or None,
             network_mode  = primary_mode,
             privileged    = hcfg.get("Privileged", False),
+            runtime       = hcfg.get("Runtime") or None,
             cap_add       = hcfg.get("CapAdd") or None,
             cap_drop      = hcfg.get("CapDrop") or None,
             devices       = hcfg.get("Devices") or None,
@@ -600,6 +603,8 @@ def migrate(db) -> None:
         "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS new_image_vulns JSONB",
         "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS new_image_scanned_at TIMESTAMPTZ",
         "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS last_update_error TEXT",
+        "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS update_started_at TIMESTAMPTZ",
+        "ALTER TABLE container_update_status ADD COLUMN IF NOT EXISTS running_image_id VARCHAR",
     ]:
         try:
             db.execute(text(stmt))
@@ -651,7 +656,7 @@ def _get_update_status_row(db, container_name: str, host_id=None) -> dict | None
         SELECT id, container_name, host_id, image, current_digest, latest_digest,
                has_update, checked_at, last_updated_at, update_blocked, blocked_reason,
                new_image_vulns, new_image_scanned_at, update_in_progress,
-               last_update_status, last_update_error, pinned
+               last_update_status, last_update_error, pinned, update_started_at, running_image_id
         FROM container_update_status
         WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)
     """), {"n": container_name, "h": host_id}).fetchone()
@@ -661,10 +666,10 @@ def _get_update_status_row(db, container_name: str, host_id=None) -> dict | None
         "id", "container_name", "host_id", "image", "current_digest", "latest_digest",
         "has_update", "checked_at", "last_updated_at", "update_blocked", "blocked_reason",
         "new_image_vulns", "new_image_scanned_at", "update_in_progress",
-        "last_update_status", "last_update_error", "pinned",
+        "last_update_status", "last_update_error", "pinned", "update_started_at", "running_image_id",
     ]
     d = dict(zip(keys, row))
-    for k in ("checked_at", "last_updated_at", "new_image_scanned_at"):
+    for k in ("checked_at", "last_updated_at", "new_image_scanned_at", "update_started_at"):
         if d[k]:
             d[k] = d[k].isoformat()
     return d
@@ -742,18 +747,23 @@ def _resolve_registry_image_ref(db, container_name: str, host_id, candidate_ref:
     return candidate_ref
 
 
-def _check_update_sync(image_name: str, host_url: str) -> dict:
+def _check_update_sync(image_name: str, host_url: str, running_image_id: str | None = None) -> dict:
     """
     Compare the locally-cached image digest with the remote registry manifest.
     Uses get_registry_data() which fetches only the manifest header — no pull needed.
 
-    Returns: {current_digest, latest_digest, has_update, error?}
+    If running_image_id is provided, also checks whether the running container's image
+    differs from the locally-cached image — this catches the case where a new image was
+    already pulled but the container was never restarted (stuck update).
+
+    Returns: {current_digest, latest_digest, has_update, local_image_id, error?}
     """
     if not image_name:
         return {
             "current_digest": None,
             "latest_digest": None,
             "has_update": False,
+            "local_image_id": None,
             "error": "Container has no image reference.",
         }
     if image_name.startswith("sha256:"):
@@ -761,6 +771,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
             "current_digest": image_name,
             "latest_digest": None,
             "has_update": False,
+            "local_image_id": None,
             "error": "Container is using a digest-only image reference; registry update checks require repo:tag.",
         }
 
@@ -788,11 +799,33 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
     try:
         # Manifest digest of the locally-cached image tag.
         # NOTE: local_img.id is the image config digest, not manifest digest.
+        local_image_id = None
         try:
             local_img = client.images.get(image_name)
             current_digest = _local_manifest_digest(local_img, image_name)
+            local_image_id = local_img.id
         except docker_sdk.errors.ImageNotFound:
             current_digest = None
+
+        # If the running container's image ID differs from the locally-cached image ID,
+        # a new image was pulled but the container was never restarted. Report the
+        # *actual running* image's digest as current_digest (not the newly-pulled one),
+        # so the UI doesn't confusingly show identical "Running" and "Registry" digests.
+        if running_image_id and local_image_id and running_image_id != local_image_id:
+            running_current_digest = current_digest
+            try:
+                running_img = client.images.get(running_image_id)
+                running_current_digest = _local_manifest_digest(running_img, image_name) or current_digest
+            except Exception:
+                pass
+            return {
+                "current_digest": running_current_digest,
+                "latest_digest":  current_digest,
+                "has_update":     True,
+                "local_image_id": local_image_id,
+                "pending_restart": True,
+                "error": "A newer image is already downloaded but the container has not been restarted yet.",
+            }
 
         # Digest of the latest manifest in the registry (no download)
         try:
@@ -803,6 +836,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
                 "current_digest": current_digest,
                 "latest_digest":  None,
                 "has_update":     False,
+                "local_image_id": local_image_id,
                 "error": f"Registry check failed: {exc}",
             }
 
@@ -812,6 +846,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
                 "current_digest": None,
                 "latest_digest": latest_digest,
                 "has_update": False,
+                "local_image_id": local_image_id,
                 "error": "Local manifest digest unavailable (RepoDigests missing); unable to reliably compare against registry.",
             }
 
@@ -820,6 +855,7 @@ def _check_update_sync(image_name: str, host_url: str) -> dict:
             "current_digest": current_digest,
             "latest_digest":  latest_digest,
             "has_update":     has_update,
+            "local_image_id": local_image_id,
         }
     finally:
         client.close()
@@ -921,51 +957,13 @@ def _trivy_scan_image(image_name: str) -> tuple[list, int, int]:
     Returns (vulns_list, critical_count, high_count).
     vulns_list follows the same shape as VulnTab in the frontend.
     """
-    if not shutil.which("trivy"):
-        return [], 0, 0
-    try:
-        result = subprocess.run(
-            [
-                "trivy", "image",
-                "--quiet", "--no-progress",
-                "--format", "json",
-                image_name,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"[trivy-image-scan] exited {result.returncode}: {result.stderr[:200]}", flush=True)
-            return [], 0, 0
-
-        data  = json.loads(result.stdout)
-        vulns = []
-        for res in (data.get("Results") or []):
-            for v in (res.get("Vulnerabilities") or []):
-                score = None
-                cvss  = v.get("CVSS") or {}
-                for source in ("nvd", "redhat", "ghsa"):
-                    if cvss.get(source, {}).get("V3Score"):
-                        score = cvss[source]["V3Score"]
-                        break
-                vulns.append({
-                    "id":          v.get("VulnerabilityID", ""),
-                    "severity":    v.get("Severity", "UNKNOWN").lower(),
-                    "pkg":         v.get("PkgName", ""),
-                    "installed":   v.get("InstalledVersion", ""),
-                    "fixed":       v.get("FixedVersion", ""),
-                    "title":       v.get("Title", ""),
-                    "description": (v.get("Description") or "")[:400],
-                    "score":       score,
-                    "url": f"https://nvd.nist.gov/vuln/detail/{v.get('VulnerabilityID', '')}",
-                })
-        critical = sum(1 for v in vulns if v["severity"] == "critical")
-        high     = sum(1 for v in vulns if v["severity"] == "high")
-        return vulns, critical, high
-    except Exception as e:
-        print(f"[trivy-image-scan] {e}", flush=True)
-        return [], 0, 0
+    result = run_trivy_image_scan_sync(image_name)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or f"Trivy scan failed for {image_name}")
+    vulns = result.get("vulns") or []
+    critical = sum(1 for v in vulns if v["severity"] == "critical")
+    high = sum(1 for v in vulns if v["severity"] == "high")
+    return vulns, critical, high
 
 
 # ── Notification helper ────────────────────────────────────────────────────────
@@ -1024,6 +1022,7 @@ async def _self_update_via_helper_stream(
         try:
             _upsert_update_status(db, container_name, host_id,
                                   update_in_progress=True,
+                                  update_started_at=datetime.now(timezone.utc),
                                   last_update_status=None,
                                   last_update_error=None)
         finally:
@@ -1060,14 +1059,45 @@ async def _self_update_via_helper_stream(
         if scan_first:
             db = _SessionLocal()
             try:
-                block_on_critical = _setting(db, "container_update_block_critical", "true") == "true"
+                vuln_policy     = _setting(db, "container_update_vuln_policy", "block_on_critical")
+                block_if_worse  = _setting(db, "container_update_block_if_worse", "false") == "true"
             finally:
                 db.close()
 
+            # If block_if_worse: scan current image first so we can compare counts
+            current_critical_count = 0
+            if block_if_worse and not force:
+                yield emit("LOG: [3/3] Scanning current image for baseline CVE count…")
+                def _get_current_image_ref():
+                    c_client = _make_docker_client(host_url)
+                    try:
+                        return _container_image_ref(c_client.containers.get(container_id))
+                    finally:
+                        c_client.close()
+                try:
+                    cur_img = await asyncio.to_thread(_get_current_image_ref)
+                    _, current_critical_count, _ = await asyncio.to_thread(_trivy_scan_image, cur_img)
+                    yield emit(f"LOG: [3/3] Current image baseline: {current_critical_count} critical CVE(s).")
+                except Exception as _exc:
+                    yield emit(f"LOG: [3/3] Warning: could not scan current image for comparison: {_exc}")
+
             yield emit("LOG: [3/3] Running Trivy security scan on new image…")
-            scan_vulns, critical_count, high_count = await asyncio.to_thread(
-                _trivy_scan_image, image_name
-            )
+            try:
+                scan_vulns, critical_count, high_count = await asyncio.to_thread(
+                    _trivy_scan_image, image_name
+                )
+            except Exception as scan_err:
+                yield emit(f"LOG: [ERROR] Trivy scan failed: {scan_err}")
+                yield emit("UPDATE_ERROR:Security scan failed — update aborted before deployment.")
+                db = _SessionLocal()
+                try:
+                    _upsert_update_status(db, container_name, host_id,
+                                          update_in_progress=False,
+                                          last_update_status="failed",
+                                          last_update_error=f"Trivy scan failed: {scan_err}")
+                finally:
+                    db.close()
+                return
             yield emit(
                 f"LOG: [3/3] ✓ Scan complete — "
                 f"{critical_count} critical, {high_count} high, {len(scan_vulns)} total CVEs."
@@ -1081,24 +1111,34 @@ async def _self_update_via_helper_stream(
             finally:
                 db.close()
 
-            if critical_count > 0 and block_on_critical and not force:
-                reason_str = f"{critical_count} critical CVE(s) found in new image"
-                db = _SessionLocal()
-                try:
-                    _upsert_update_status(db, container_name, host_id,
-                                          update_blocked=True,
-                                          blocked_reason=reason_str,
-                                          update_in_progress=False,
-                                          last_update_status="blocked")
-                finally:
-                    db.close()
-                yield emit(f"LOG: [BLOCKED] {reason_str} — update aborted for safety.")
-                yield emit(f"UPDATE_BLOCKED:{critical_count}")
-                return
+            if not force:
+                block_reason = None
+                if vuln_policy == "block_on_critical" and critical_count > 0:
+                    block_reason = f"{critical_count} critical CVE(s) found in new image"
+                elif vuln_policy == "block_on_high" and (critical_count + high_count) > 0:
+                    block_reason = f"{critical_count} critical, {high_count} high CVE(s) found in new image"
+                if block_reason is None and block_if_worse and critical_count > current_critical_count:
+                    block_reason = (
+                        f"New image has more critical CVEs ({critical_count}) "
+                        f"than current ({current_critical_count})"
+                    )
+                if block_reason:
+                    db = _SessionLocal()
+                    try:
+                        _upsert_update_status(db, container_name, host_id,
+                                              update_blocked=True,
+                                              blocked_reason=block_reason,
+                                              update_in_progress=False,
+                                              last_update_status="blocked")
+                    finally:
+                        db.close()
+                    yield emit(f"LOG: [BLOCKED] {block_reason} — update aborted for safety.")
+                    yield emit(f"UPDATE_BLOCKED:{critical_count}")
+                    return
 
-            if critical_count > 0 and force:
+            if (critical_count > 0 or high_count > 0) and force:
                 yield emit(
-                    f"LOG: [WARNING] {critical_count} critical CVE(s) found "
+                    f"LOG: [WARNING] {critical_count} critical, {high_count} high CVE(s) found "
                     "— proceeding anyway (force override active)."
                 )
         else:
@@ -1237,7 +1277,9 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
     net_sets = attrs.get("NetworkSettings", {})
 
     # Port bindings + exposed ports
-    port_bindings, exposed_ports = _extract_ports_from_network_settings(net_sets.get("Ports"))
+    port_bindings, exposed_ports = _extract_ports_from_network_settings(
+        hcfg.get("PortBindings") or net_sets.get("Ports")
+    )
 
     # Bind mounts + named volumes
     binds = {}
@@ -1272,6 +1314,9 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
         None if _net_lo in ("host","none") or _net_lo.startswith("container:")
         else (config.get("Hostname") or dep_name)
     )
+    # host/none/container: network modes don't support port bindings
+    if _net_lo in ("host", "none") or _net_lo.startswith("container:"):
+        port_bindings, exposed_ports = None, []
 
     try:
         _cres = client.api.create_container(
@@ -1293,6 +1338,7 @@ def _recreate_container_with_net(client, dep, new_net_mode: str) -> None:
                 volumes_from  = hcfg.get("VolumesFrom") or None,
                 network_mode  = new_net_mode,
                 privileged    = hcfg.get("Privileged", False),
+                runtime       = hcfg.get("Runtime") or None,
                 cap_add       = hcfg.get("CapAdd") or None,
                 cap_drop      = hcfg.get("CapDrop") or None,
                 devices       = hcfg.get("Devices") or None,
@@ -1504,24 +1550,94 @@ async def _safe_update_stream(
             try:
                 _upsert_update_status(db, container_name, host_id,
                                       update_in_progress=True,
+                                      update_started_at=datetime.now(timezone.utc),
                                       last_update_status=None,
                                       last_update_error=None)
             finally:
                 db.close()
 
-            # ── Stage 2: Pull latest image ─────────────────────────────────
+            # ── Stage 2: Pull latest image (streaming so SSE stays alive) ──
             yield emit(f"LOG: [2/7] Pulling latest image: {image_name}…")
 
-            def _pull():
-                client = _make_docker_client(host_url)
+            loop      = asyncio.get_running_loop()
+            pull_q: asyncio.Queue = asyncio.Queue()
+            _pull_exc: list       = []
+
+            def _streaming_pull():
+                # Use APIClient directly with an explicit timeout so that if the
+                # Docker daemon goes silent mid-pull (e.g. stuck on extraction or
+                # a hung registry connection), the socket raises ReadTimeout instead
+                # of blocking the thread forever.  300 s per-chunk is generous
+                # enough for slow hardware but will catch genuine daemon hangs.
                 try:
-                    img = client.images.pull(image_name)
-                    return img.id
+                    import docker as _docker
+                    pull_client = _docker.APIClient(base_url=host_url, timeout=300)
+                except Exception as e:
+                    _pull_exc.append(e)
+                    loop.call_soon_threadsafe(pull_q.put_nowait, None)
+                    return
+                try:
+                    for evt in pull_client.pull(image_name, stream=True, decode=True):
+                        loop.call_soon_threadsafe(pull_q.put_nowait, evt)
+                except Exception as e:
+                    _pull_exc.append(e)
                 finally:
-                    client.close()
+                    try:
+                        pull_client.close()
+                    except Exception:
+                        pass
+                    loop.call_soon_threadsafe(pull_q.put_nowait, None)  # sentinel
+
+            _pull_task   = asyncio.create_task(asyncio.to_thread(_streaming_pull))
+            _layer_done: set[str]      = set()
+            _dl_pct:     dict[str,int] = {}
+            _ex_pct:     dict[str,int] = {}
 
             try:
-                new_image_id = await asyncio.to_thread(_pull)
+                while True:
+                    # Use a timeout so we can send SSE keepalive comments during
+                    # long silent phases (e.g. extraction). Without this, nginx's
+                    # proxy_read_timeout (typically 60s) kills the connection.
+                    try:
+                        evt = await asyncio.wait_for(pull_q.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        # No Docker event for 15s — send a keepalive SSE comment
+                        # to prevent any upstream proxy from timing out.
+                        yield ": keep-alive\n\n"
+                        continue
+                    if evt is None:
+                        break
+                    status = evt.get('status', '')
+                    layer  = evt.get('id', '')
+                    detail = evt.get('progressDetail') or {}
+                    if status in ('Pull complete', 'Already exists', 'Download complete', 'Verifying Checksum'):
+                        if layer and layer not in _layer_done:
+                            _layer_done.add(layer)
+                            yield emit(f"LOG:   [{layer[:12]}] {status}")
+                    elif status == 'Downloading' and layer and detail.get('total'):
+                        pct       = int(detail['current'] / detail['total'] * 100)
+                        milestone = (pct // 25) * 25
+                        if _dl_pct.get(layer, -1) != milestone:
+                            _dl_pct[layer] = milestone
+                            yield emit(f"LOG:   [{layer[:12]}] downloading {milestone}%")
+                    elif status == 'Extracting' and layer and detail.get('total'):
+                        pct       = int(detail['current'] / detail['total'] * 100)
+                        milestone = (pct // 50) * 50  # emit at 0%, 50%, 100%
+                        if _ex_pct.get(layer, -1) != milestone:
+                            _ex_pct[layer] = milestone
+                            yield emit(f"LOG:   [{layer[:12]}] extracting {milestone}%")
+                await _pull_task
+                if _pull_exc:
+                    raise _pull_exc[0]
+
+                def _get_image_id():
+                    client = _make_docker_client(host_url)
+                    try:
+                        return client.images.get(image_name).id
+                    finally:
+                        client.close()
+
+                new_image_id = await asyncio.to_thread(_get_image_id)
                 yield emit(f"LOG: [2/7] ✓ Pull complete. Digest: {new_image_id[:19]}…")
             except Exception as pull_err:
                 yield emit(f"LOG: [ERROR] Image pull failed: {pull_err}")
@@ -1544,15 +1660,45 @@ async def _safe_update_stream(
             if scan_first:
                 db = _SessionLocal()
                 try:
-                    block_on_critical = _setting(db, "container_update_block_critical", "true") == "true"
+                    vuln_policy    = _setting(db, "container_update_vuln_policy", "block_on_critical")
+                    block_if_worse = _setting(db, "container_update_block_if_worse", "false") == "true"
                 finally:
                     db.close()
 
-                yield emit(f"LOG: [3/7] Running Trivy security scan on new image…")
+                # If block_if_worse: scan current image first so we can compare
+                current_critical_count = 0
+                if block_if_worse and not force:
+                    yield emit("LOG: [3/7] Scanning current image for baseline CVE count…")
+                    def _get_cur_img_ref():
+                        c_client = _make_docker_client(host_url)
+                        try:
+                            return _container_image_ref(c_client.containers.get(container_id))
+                        finally:
+                            c_client.close()
+                    try:
+                        cur_img = await asyncio.to_thread(_get_cur_img_ref)
+                        _, current_critical_count, _ = await asyncio.to_thread(_trivy_scan_image, cur_img)
+                        yield emit(f"LOG: [3/7] Current image baseline: {current_critical_count} critical CVE(s).")
+                    except Exception as _exc:
+                        yield emit(f"LOG: [3/7] Warning: could not scan current image for comparison: {_exc}")
 
-                scan_vulns, critical_count, high_count = await asyncio.to_thread(
-                    _trivy_scan_image, image_name
-                )
+                yield emit("LOG: [3/7] Running Trivy security scan on new image…")
+                try:
+                    scan_vulns, critical_count, high_count = await asyncio.to_thread(
+                        _trivy_scan_image, image_name
+                    )
+                except Exception as scan_err:
+                    yield emit(f"LOG: [ERROR] Trivy scan failed: {scan_err}")
+                    yield emit("UPDATE_ERROR:Security scan failed — update aborted before deployment.")
+                    db = _SessionLocal()
+                    try:
+                        _upsert_update_status(db, container_name, host_id,
+                                              update_in_progress=False,
+                                              last_update_status="failed",
+                                              last_update_error=f"Trivy scan failed: {scan_err}")
+                    finally:
+                        db.close()
+                    return
                 yield emit(
                     f"LOG: [3/7] ✓ Scan complete — "
                     f"{critical_count} critical, {high_count} high, {len(scan_vulns)} total CVEs."
@@ -1566,29 +1712,39 @@ async def _safe_update_stream(
                 finally:
                     db.close()
 
-                if critical_count > 0 and block_on_critical and not force:
-                    reason_str = f"{critical_count} critical CVE(s) found in new image"
-                    db = _SessionLocal()
-                    try:
-                        _upsert_update_status(db, container_name, host_id,
-                                              update_blocked=True,
-                                              blocked_reason=reason_str,
-                                              update_in_progress=False,
-                                              last_update_status="blocked")
-                    finally:
-                        db.close()
-                    yield emit(f"LOG: [BLOCKED] {reason_str} — update aborted for safety.")
-                    yield emit(f"UPDATE_BLOCKED:{critical_count}")
-                    _fire_notification(
-                        "container.update_blocked",
-                        "Container Update Blocked",
-                        f"{container_name}: blocked — {critical_count} critical CVE(s) in new image",
-                    )
-                    return
+                if not force:
+                    block_reason = None
+                    if vuln_policy == "block_on_critical" and critical_count > 0:
+                        block_reason = f"{critical_count} critical CVE(s) found in new image"
+                    elif vuln_policy == "block_on_high" and (critical_count + high_count) > 0:
+                        block_reason = f"{critical_count} critical, {high_count} high CVE(s) found in new image"
+                    if block_reason is None and block_if_worse and critical_count > current_critical_count:
+                        block_reason = (
+                            f"New image has more critical CVEs ({critical_count}) "
+                            f"than current ({current_critical_count})"
+                        )
+                    if block_reason:
+                        db = _SessionLocal()
+                        try:
+                            _upsert_update_status(db, container_name, host_id,
+                                                  update_blocked=True,
+                                                  blocked_reason=block_reason,
+                                                  update_in_progress=False,
+                                                  last_update_status="blocked")
+                        finally:
+                            db.close()
+                        yield emit(f"LOG: [BLOCKED] {block_reason} — update aborted for safety.")
+                        yield emit(f"UPDATE_BLOCKED:{critical_count}")
+                        _fire_notification(
+                            "container.update_blocked",
+                            "Container Update Blocked",
+                            f"{container_name}: blocked — {block_reason}",
+                        )
+                        return
 
-                if critical_count > 0 and force:
+                if (critical_count > 0 or high_count > 0) and force:
                     yield emit(
-                        f"LOG: [WARNING] {critical_count} critical CVE(s) found "
+                        f"LOG: [WARNING] {critical_count} critical, {high_count} high CVE(s) found "
                         f"— proceeding anyway (force override active)."
                     )
             else:
@@ -1602,6 +1758,7 @@ async def _safe_update_stream(
                 try:
                     c         = client.containers.get(container_id)
                     orig_name = c.name.lstrip("/")
+                    was_running = c.status == "running"
                     if c.status not in ("exited", "created"):
                         c.stop(timeout=30)
                         c.reload()
@@ -1609,12 +1766,13 @@ async def _safe_update_stream(
                     bname = f"{orig_name}_inspectre_bak_{ts}"
                     c.rename(bname)
                     c.reload()
-                    return orig_name, bname, c.id
+                    return orig_name, bname, c.id, was_running
                 finally:
                     client.close()
 
-            orig_name, backup_cname, old_id = await asyncio.to_thread(_stop_and_rename)
-            yield emit(f"LOG: [4/7] ✓ Stopped. Old container preserved as '{backup_cname}'.")
+            orig_name, backup_cname, old_id, was_running = await asyncio.to_thread(_stop_and_rename)
+            _stopped_verb = "Stopped" if was_running else "Preserved (was already stopped)"
+            yield emit(f"LOG: [4/7] ✓ {_stopped_verb}. Old container preserved as '{backup_cname}'.")
 
             # ── Stage 5+6: Create and start new container ──────────────────
             yield emit("LOG: [5/7] Creating new container with updated image…")
@@ -1629,7 +1787,9 @@ async def _safe_update_stream(
                     net_cfg  = attrs.get("NetworkSettings", {})
 
                     # Reconstruct published ports from the old container
-                    port_bindings, exposed_ports = _extract_ports_from_network_settings(net_cfg.get("Ports"))
+                    port_bindings, exposed_ports = _extract_ports_from_network_settings(
+                        hcfg.get("PortBindings") or net_cfg.get("Ports")
+                    )
 
                     # Reconstruct bind mounts
                     binds = {}
@@ -1668,6 +1828,9 @@ async def _safe_update_stream(
                         None if _net_mode in ("host", "none") or _net_mode.startswith("container:")
                         else (config.get("Hostname") or orig_name)
                     )
+                    # host/none/container: network modes don't support port bindings
+                    if _net_mode in ("host", "none") or _net_mode.startswith("container:"):
+                        port_bindings, exposed_ports = None, []
                     _cres = client.api.create_container(
                         image         = image_name,
                         name          = orig_name,
@@ -1687,6 +1850,7 @@ async def _safe_update_stream(
                             volumes_from   = hcfg.get("VolumesFrom") or None,
                             network_mode   = _raw_net_mode,
                             privileged     = hcfg.get("Privileged", False),
+                            runtime        = hcfg.get("Runtime") or None,
                             cap_add        = hcfg.get("CapAdd") or None,
                             cap_drop       = hcfg.get("CapDrop") or None,
                             devices        = hcfg.get("Devices") or None,
@@ -1717,14 +1881,15 @@ async def _safe_update_stream(
                             )
                         except Exception:
                             pass
-                    try:
-                        new_c.start()
-                    except Exception:
+                    if was_running:
                         try:
-                            new_c.remove(force=True)
+                            new_c.start()
                         except Exception:
-                            pass
-                        raise
+                            try:
+                                new_c.remove(force=True)
+                            except Exception:
+                                pass
+                            raise
                     new_c.reload()
                     return new_c
                 finally:
@@ -1732,7 +1897,12 @@ async def _safe_update_stream(
 
             try:
                 new_container = await asyncio.to_thread(_create_and_start)
-                yield emit(f"LOG: [5/7] ✓ New container '{orig_name}' created and started.")
+                _created_msg = (
+                    f"New container '{orig_name}' created and started."
+                    if was_running else
+                    f"New container '{orig_name}' created (left stopped — was not running before update)."
+                )
+                yield emit(f"LOG: [5/7] ✓ {_created_msg}")
             except Exception as create_err:
                 yield emit(f"LOG: [ERROR] Container creation failed: {create_err}")
                 yield emit("LOG: [ROLLBACK] Restoring original container…")
@@ -1748,20 +1918,23 @@ async def _safe_update_stream(
                             client.close()
                     bak_c = await asyncio.to_thread(_rollback_rename)
                     yield emit(f"LOG: [ROLLBACK] ✓ Renamed '{backup_cname}' back to '{orig_name}'.")
-                    try:
-                        def _rollback_start():
-                            client = _make_docker_client(host_url)
-                            try:
-                                client.containers.get(orig_name).start()
-                            finally:
-                                client.close()
-                        await asyncio.to_thread(_rollback_start)
-                        yield emit("LOG: [ROLLBACK] ✓ Original container is running again.")
-                    except Exception as start_err:
-                        yield emit(
-                            f"LOG: [ROLLBACK] Container renamed but could not auto-start "
-                            f"(likely container-mode networking — start '{orig_name}' manually). Error: {start_err}"
-                        )
+                    if was_running:
+                        try:
+                            def _rollback_start():
+                                client = _make_docker_client(host_url)
+                                try:
+                                    client.containers.get(orig_name).start()
+                                finally:
+                                    client.close()
+                            await asyncio.to_thread(_rollback_start)
+                            yield emit("LOG: [ROLLBACK] ✓ Original container is running again.")
+                        except Exception as start_err:
+                            yield emit(
+                                f"LOG: [ROLLBACK] Container renamed but could not auto-start "
+                                f"(likely container-mode networking — start '{orig_name}' manually). Error: {start_err}"
+                            )
+                    else:
+                        yield emit(f"LOG: [ROLLBACK] ✓ Original container restored (left stopped — was not running before update).")
                 except Exception as rb_err:
                     yield emit(
                         f"LOG: [ROLLBACK FAILED] Could not rename backup — "
@@ -1778,7 +1951,49 @@ async def _safe_update_stream(
                     db.close()
                 return
 
-            # ── Stage 7: Health check ──────────────────────────────────────
+            # ── Stage 7: Health check (skipped for containers that were not running) ──
+            if not was_running:
+                yield emit("LOG: [6/7] Health check skipped — container was not running before update.")
+                yield emit("LOG: [7/7] Image updated successfully. Container left in stopped state.")
+                new_container.reload()
+                new_digest = new_container.image.id
+                if scan_first:
+                    from background_loops import _save_trivy_result
+                    _save_trivy_result(container_name, image_name, scan_vulns, datetime.now(timezone.utc).isoformat(), image_id=new_digest)
+                db = _SessionLocal()
+                try:
+                    _upsert_update_status(db, container_name, host_id,
+                                          image               = image_name,
+                                          current_digest      = new_digest,
+                                          latest_digest       = new_digest,
+                                          running_image_id    = new_digest,
+                                          has_update          = False,
+                                          update_blocked      = False,
+                                          blocked_reason      = None,
+                                          update_in_progress  = False,
+                                          last_updated_at     = datetime.now(timezone.utc),
+                                          last_update_status  = "success",
+                                          last_update_error   = None)
+                finally:
+                    db.close()
+                def _cleanup_backup_stopped():
+                    client = _make_docker_client(host_url)
+                    try:
+                        client.containers.get(backup_cname).remove(force=True)
+                    except Exception:
+                        pass
+                    finally:
+                        client.close()
+                await asyncio.to_thread(_cleanup_backup_stopped)
+                yield emit(f"LOG: ✓ Update complete! {container_name} image updated to {image_name} ({new_digest[:19]}…) — start it manually when ready.")
+                yield emit("UPDATE_DONE:success")
+                _fire_notification(
+                    "container.updated",
+                    "Container Updated",
+                    f"{container_name} image updated to {image_name} ({new_digest[:19]}…) — container left stopped.",
+                )
+                return
+
             yield emit("LOG: [6/7] Running health check…")
 
             db = _SessionLocal()
@@ -1872,6 +2087,9 @@ async def _safe_update_stream(
 
                 new_container.reload()
                 new_digest = new_container.image.id
+                if scan_first:
+                    from background_loops import _save_trivy_result
+                    _save_trivy_result(container_name, image_name, scan_vulns, datetime.now(timezone.utc).isoformat(), image_id=new_digest)
 
                 db = _SessionLocal()
                 try:
@@ -1879,6 +2097,7 @@ async def _safe_update_stream(
                                           image               = image_name,
                                           current_digest      = new_digest,
                                           latest_digest       = new_digest,
+                                          running_image_id    = new_digest,
                                           has_update          = False,
                                           update_blocked      = False,
                                           blocked_reason      = None,
@@ -1912,13 +2131,15 @@ async def _safe_update_stream(
                         # Restore backup
                         bak = client.containers.get(backup_cname)
                         bak.rename(orig_name)
-                        bak.start()
+                        if was_running:
+                            bak.start()
                     finally:
                         client.close()
 
                 try:
                     await asyncio.to_thread(_rollback)
-                    yield emit(f"LOG: [ROLLBACK] ✓ '{orig_name}' restored to previous version and running.")
+                    _rb_state = "running" if was_running else "stopped"
+                    yield emit(f"LOG: [ROLLBACK] ✓ '{orig_name}' restored to previous version ({_rb_state}).")
                     yield emit("UPDATE_DONE:rolled_back")
                     rollback_status = "rolled_back"
                 except Exception as rb_err:
@@ -1992,6 +2213,11 @@ def _check_all_containers_for_host(
     for c in containers:
         cname      = c.name.lstrip("/")
         image_name = _container_image_ref(c)
+        # c.image.id is the config digest of the image the container is actually
+        # running — used to detect "new image pulled but container not yet
+        # restarted" the same way the manual check-update endpoint does.
+        running_img = getattr(c, "image", None)
+        running_image_id = running_img.id if running_img else None
         if progress_cb:
             try:
                 progress_cb("start", cname, host_url, host_id, total)
@@ -2030,25 +2256,24 @@ def _check_all_containers_for_host(
                 db = _SessionLocal()
                 try:
                     image_for_check = _resolve_registry_image_ref(db, cname, host_id, image_name)
-                    prev = db.execute(
-                        text("""SELECT has_update FROM container_update_status
-                                WHERE container_name=:n AND COALESCE(host_id,-1)=COALESCE(:h,-1)"""),
-                        {"n": cname, "h": host_id},
-                    ).fetchone()
-                    had_update = bool(prev and prev[0])
+                    prev = _get_update_status_row(db, cname, host_id)
+                    had_update = bool(prev and prev.get("has_update"))
                 finally:
                     db.close()
 
-                result = _check_update_sync(image_for_check, host_url)
+                result = _check_update_sync(image_for_check, host_url, running_image_id)
 
                 db = _SessionLocal()
                 try:
                     kw = dict(
-                        image          = image_for_check,
-                        current_digest = result.get("current_digest"),
-                        latest_digest  = result.get("latest_digest"),
-                        has_update     = result.get("has_update", False),
-                        checked_at     = datetime.now(timezone.utc),
+                        image             = image_for_check,
+                        current_digest    = result.get("current_digest"),
+                        latest_digest     = result.get("latest_digest"),
+                        has_update        = result.get("has_update", False),
+                        checked_at        = datetime.now(timezone.utc),
+                        running_image_id  = running_image_id,
+                        last_update_status = "update_available" if result.get("has_update", False) else "checked",
+                        last_update_error  = result.get("error"),
                     )
                     if not result.get("has_update"):
                         kw["update_blocked"] = False
@@ -2063,6 +2288,38 @@ def _check_all_containers_for_host(
                         "Container Update Available",
                         f"New image version available for {cname} ({image_for_check})",
                     )
+
+                # Scheduled auto-update modes should actually perform the update.
+                # - notify: only alert
+                # - disabled: check only
+                # - scan_then_update: scan first, then update if the scan/policy allows
+                # - auto: update immediately, skipping the vulnerability scan gate
+                if result.get("has_update") and auto_update in ("auto", "scan_then_update"):
+                    if prev and (
+                        prev.get("pinned")
+                        or prev.get("update_blocked")
+                        or prev.get("update_in_progress")
+                    ):
+                        continue
+
+                    scan_first = auto_update == "scan_then_update"
+
+                    async def _consume_update():
+                        async for _ in _safe_update_stream(
+                            c.id, host_url, host_id,
+                            force=False, scan_first=scan_first,
+                        ):
+                            pass
+
+                    try:
+                        print(
+                            f"[update-check] auto-update starting for {cname} "
+                            f"(mode={auto_update}, scan_first={scan_first})",
+                            flush=True,
+                        )
+                        asyncio.run(_consume_update())
+                    except Exception as exc:
+                        print(f"[update-check] auto-update failed for {cname}: {exc}", flush=True)
 
             except Exception as exc:
                 print(f"[update-check] {cname}: {exc}", flush=True)
@@ -2104,6 +2361,27 @@ async def container_update_check_loop() -> None:
     last_check_date = None
     while True:
         try:
+            # Reset any update_in_progress flags that have been stuck for > 30 minutes.
+            # This handles crashes or hung pulls that never cleared the flag.
+            _stale_db = _SessionLocal()
+            try:
+                _stale_db.execute(text("""
+                    UPDATE container_update_status
+                    SET update_in_progress = FALSE,
+                        has_update         = TRUE,
+                        last_update_status = 'failed',
+                        last_update_error  = COALESCE(last_update_error,
+                            'Update timed out — the process may have crashed. Please retry.')
+                    WHERE update_in_progress = TRUE
+                      AND update_started_at IS NOT NULL
+                      AND update_started_at < NOW() - INTERVAL '30 minutes'
+                """))
+                _stale_db.commit()
+            except Exception:
+                _stale_db.rollback()
+            finally:
+                _stale_db.close()
+
             db = _SessionLocal()
             try:
                 enabled     = _setting(db, "container_check_enabled", "false") == "true"
@@ -2218,34 +2496,39 @@ async def check_container_update(container_id: str, request: Request):
             client = _make_docker_client(host_url)
             try:
                 c = client.containers.get(container_id)
-                return c.name.lstrip("/"), _container_image_ref(c)
+                # c.image.id is the config digest of the running image layer
+                running_img_id = getattr(c, "image", None)
+                running_img_id = running_img_id.id if running_img_id else None
+                return c.name.lstrip("/"), _container_image_ref(c), running_img_id
             finally:
                 client.close()
 
         try:
-            container_name, image_name = await asyncio.to_thread(_get_info)
+            container_name, image_name, running_image_id = await asyncio.to_thread(_get_info)
         except docker_sdk.errors.NotFound:
             raise HTTPException(404, "Container not found. It may have been recreated with a new ID; refresh the container list and try again.")
         raw_image_name = image_name
         image_name = _resolve_registry_image_ref(db, container_name, host_id, image_name)
         print(
             "[update-check] manual check: "
-            f"container={container_name} image={image_name} raw_image={raw_image_name} host={host_url}",
+            f"container={container_name} image={image_name} raw_image={raw_image_name} "
+            f"running_image_id={running_image_id} host={host_url}",
             flush=True,
         )
-        result = await asyncio.to_thread(_check_update_sync, image_name, host_url)
+        result = await asyncio.to_thread(_check_update_sync, image_name, host_url, running_image_id)
 
         prev = _get_update_status_row(db, container_name, host_id)
         had_update = bool(prev and prev.get("has_update"))
 
         kw = dict(
-            image          = image_name,
-            current_digest = result.get("current_digest"),
-            latest_digest  = result.get("latest_digest"),
-            has_update     = result.get("has_update", False),
-            checked_at     = datetime.now(timezone.utc),
+            image            = image_name,
+            current_digest   = result.get("current_digest"),
+            latest_digest    = result.get("latest_digest"),
+            has_update       = result.get("has_update", False),
+            checked_at       = datetime.now(timezone.utc),
+            running_image_id = running_image_id,
             last_update_status = "update_available" if result.get("has_update", False) else "checked",
-            last_update_error = result.get("error"),
+            last_update_error  = result.get("error"),
         )
         if not result.get("has_update"):
             kw["update_blocked"] = False
@@ -2312,7 +2595,12 @@ async def scan_new_image_endpoint(container_id: str, request: Request):
             yield "data: SCAN_DONE:error\n\n"
             return
 
-        vulns, critical, high = await asyncio.to_thread(_trivy_scan_image, image_name)
+        try:
+            vulns, critical, high = await asyncio.to_thread(_trivy_scan_image, image_name)
+        except Exception as scan_err:
+            yield f"data: LOG: Trivy scan failed: {scan_err}\n\n"
+            yield "data: SCAN_DONE:error\n\n"
+            return
         db2 = _SessionLocal()
         try:
             _upsert_update_status(db2, container_name, host_id,
@@ -2455,6 +2743,638 @@ async def get_backup_compose(backup_id: int, request: Request):
         db.close()
 
 
+async def _deploy_compose_stream(compose_yaml: str, host_url: str):
+    """
+    Async generator: parse a compose YAML and deploy all services via the Docker SDK.
+    Yields SSE-formatted 'data: LOG: …' lines plus a final 'data: DEPLOY_DONE' or
+    'data: DEPLOY_ERROR:…' line.  No subprocess / docker CLI required.
+
+    Every await and every parsing step is guarded so that any exception becomes a
+    DEPLOY_ERROR line rather than crashing the async generator mid-stream (which
+    would give the browser an opaque "Error in input stream" message).
+    """
+    import yaml as _yaml
+    import shlex as _shlex
+    import traceback as _tb
+
+    def emit(msg: str) -> str:
+        return f"data: {msg}\n\n"
+
+    # ── Parse YAML ────────────────────────────────────────────────────────────
+    try:
+        doc = _yaml.safe_load(compose_yaml)
+    except Exception as e:
+        yield emit(f"DEPLOY_ERROR:Invalid YAML: {e}")
+        return
+
+    if not isinstance(doc, dict):
+        yield emit("DEPLOY_ERROR:YAML did not parse to a mapping — check the file structure")
+        return
+
+    services    = doc.get("services") or {}
+    top_networks = doc.get("networks") or {}
+
+    if not services:
+        yield emit("DEPLOY_ERROR:No services found in compose YAML")
+        return
+
+    yield emit(f"LOG: Found {len(services)} service(s): {', '.join(services.keys())}")
+
+    # ── Per-service deployment ────────────────────────────────────────────────
+    for svc_name, svc_cfg in services.items():
+        try:
+            svc_cfg = svc_cfg or {}
+            image = svc_cfg.get("image")
+            if not image:
+                yield emit(f"LOG: [{svc_name}] No image specified — skipping")
+                continue
+
+            container_name = svc_cfg.get("container_name") or svc_name
+            yield emit(f"LOG: [{svc_name}] Deploying '{container_name}' ({image})")
+
+            # ── Pull image ────────────────────────────────────────────────────
+            yield emit(f"LOG: [{svc_name}] Pulling {image}…")
+            try:
+                def _pull(img=image):
+                    c = _make_docker_client(host_url)
+                    try:
+                        c.images.pull(img)
+                    finally:
+                        c.close()
+                await asyncio.to_thread(_pull)
+                yield emit(f"LOG: [{svc_name}] ✓ Pull complete")
+            except Exception as pe:
+                yield emit(f"LOG: [{svc_name}] Warning: pull failed ({pe}) — using cached image if available")
+
+            # ── Stop & remove existing container ──────────────────────────────
+            yield emit(f"LOG: [{svc_name}] Stopping '{container_name}' (if running)…")
+            try:
+                def _stop_remove(cname=container_name):
+                    c = _make_docker_client(host_url)
+                    try:
+                        try:
+                            existing = c.containers.get(cname)
+                            if existing.status not in ("exited", "created"):
+                                existing.stop(timeout=15)
+                            existing.remove(force=True)
+                        except docker_sdk.errors.NotFound:
+                            pass  # nothing to remove
+                    finally:
+                        c.close()
+                await asyncio.to_thread(_stop_remove)
+                yield emit(f"LOG: [{svc_name}] ✓ Old container removed")
+            except Exception as se:
+                yield emit(f"LOG: [{svc_name}] Warning: could not remove old container ({se}) — continuing")
+
+            # ── Parse ports ───────────────────────────────────────────────────
+            port_bindings: dict = {}
+            exposed_ports: list = []
+            for p in (svc_cfg.get("ports") or []):
+                try:
+                    p = str(p)
+                    parts = p.rsplit(":", 1)
+                    if len(parts) == 2:
+                        host_part, ctr_part = parts
+                        host_sub = host_part.rsplit(":", 1)
+                        host_ip   = host_sub[0] if len(host_sub) == 2 else ""
+                        host_port = host_sub[1] if len(host_sub) == 2 else host_sub[0]
+                        proto = "tcp"
+                        if "/" in ctr_part:
+                            port_parts = ctr_part.rsplit("/", 1)
+                            if len(port_parts) != 2:
+                                raise ValueError("invalid container port")
+                            ctr_port_num, proto = port_parts
+                        else:
+                            ctr_port_num = ctr_part
+                        if proto not in {"tcp", "udp", "sctp"} or not ctr_port_num.isdigit():
+                            raise ValueError("invalid container port")
+                        key = f"{ctr_port_num}/{proto}"
+                        binding: dict = {"HostPort": str(host_port)}
+                        if host_ip:
+                            binding["HostIp"] = host_ip
+                        port_bindings.setdefault(key, []).append(binding)
+                        exposed_ports.append(key)
+                    else:
+                        ctr_part = parts[0]
+                        proto = "tcp"
+                        if "/" in ctr_part:
+                            port_parts = ctr_part.rsplit("/", 1)
+                            if len(port_parts) != 2:
+                                raise ValueError("invalid container port")
+                            ctr_port_num, proto = port_parts
+                        else:
+                            ctr_port_num = ctr_part
+                        if proto not in {"tcp", "udp", "sctp"} or not ctr_port_num.isdigit():
+                            raise ValueError("invalid container port")
+                        exposed_ports.append(f"{ctr_port_num}/{proto}")
+                except Exception:
+                    yield emit(f"LOG: [{svc_name}] Warning: could not parse port entry '{p}' — skipping")
+
+            # ── Parse volumes ─────────────────────────────────────────────────
+            binds: dict = {}
+            for v in (svc_cfg.get("volumes") or []):
+                try:
+                    if isinstance(v, dict):
+                        src  = v.get("source", "")
+                        dst  = v.get("target", "")
+                        mode = v.get("mode") or ("ro" if v.get("read_only") else "rw")
+                        if src and dst:
+                            binds[src] = {"bind": dst, "mode": mode}
+                    else:
+                        raw = str(v)
+                        parts = raw.rsplit(":", 2)
+                        if len(parts) == 2:
+                            src, dst = parts
+                            mode = "rw"
+                        elif len(parts) == 3:
+                            src, dst, mode = parts
+                        else:
+                            continue
+                        if src and dst:
+                            binds[src] = {"bind": dst, "mode": mode or "rw"}
+                except Exception:
+                    yield emit(f"LOG: [{svc_name}] Warning: could not parse volume entry — skipping")
+
+            # ── Environment ───────────────────────────────────────────────────
+            env_raw = svc_cfg.get("environment")
+            if isinstance(env_raw, dict):
+                env_list = [f"{k}={val}" for k, val in env_raw.items()]
+            elif isinstance(env_raw, list):
+                env_list = [str(e) for e in env_raw]
+            else:
+                env_list = None
+
+            # ── Labels ────────────────────────────────────────────────────────
+            labels_raw = svc_cfg.get("labels") or {}
+            if isinstance(labels_raw, list):
+                labels = {ll.split("=", 1)[0]: (ll.split("=", 1)[1] if "=" in ll else "") for ll in labels_raw}
+            else:
+                labels = dict(labels_raw)
+
+            # ── Restart policy ────────────────────────────────────────────────
+            restart_raw = str(svc_cfg.get("restart", "no"))
+            if ":" in restart_raw:
+                rp_name, rp_ret = restart_raw.split(":", 1)
+                rp = {"Name": rp_name, "MaximumRetryCount": int(rp_ret)}
+            else:
+                rp = {"Name": restart_raw, "MaximumRetryCount": 0}
+
+            # ── Networks ──────────────────────────────────────────────────────
+            network_mode_raw = svc_cfg.get("network_mode")
+            svc_nets_raw = svc_cfg.get("networks") or []
+            if isinstance(svc_nets_raw, dict):
+                svc_nets_raw = list(svc_nets_raw.keys())
+            svc_nets = []
+            for sn in svc_nets_raw:
+                top_cfg = top_networks.get(sn) or {}
+                svc_nets.append(top_cfg.get("name") or sn)
+
+            if network_mode_raw:
+                net_mode = network_mode_raw
+                post_connect_nets: list = []
+            elif svc_nets:
+                net_mode = svc_nets[0]
+                post_connect_nets = svc_nets[1:]
+            else:
+                net_mode = "bridge"
+                post_connect_nets = []
+
+            _net_lo = (net_mode or "").lower()
+            if _net_lo in ("host", "none") or _net_lo.startswith("container:"):
+                port_bindings_arg = None
+                exposed_ports_arg: list = []
+            else:
+                port_bindings_arg = port_bindings or None
+                exposed_ports_arg = exposed_ports
+
+            hostname = svc_cfg.get("hostname") or (
+                None if _net_lo in ("host", "none") or _net_lo.startswith("container:") else container_name
+            )
+
+            # ── Misc host-config fields ───────────────────────────────────────
+            tmpfs_raw = svc_cfg.get("tmpfs")
+            if isinstance(tmpfs_raw, dict):
+                tmpfs = dict(tmpfs_raw)
+            elif isinstance(tmpfs_raw, str):
+                tmpfs = {tmpfs_raw: ""}
+            elif isinstance(tmpfs_raw, list):
+                tmpfs = {t: "" for t in tmpfs_raw}
+            else:
+                tmpfs = None
+
+            devices_raw = svc_cfg.get("devices") or []
+            devices = []
+            for d in devices_raw:
+                dp = str(d).split(":")
+                devices.append({
+                    "PathOnHost":        dp[0],
+                    "PathInContainer":   dp[1] if len(dp) > 1 else dp[0],
+                    "CgroupPermissions": dp[2] if len(dp) > 2 else "rwm",
+                })
+
+            extra_hosts_raw = svc_cfg.get("extra_hosts") or []
+            extra_hosts = (
+                [f"{k}:{v}" for k, v in extra_hosts_raw.items()]
+                if isinstance(extra_hosts_raw, dict) else list(extra_hosts_raw)
+            )
+
+            dns_raw = svc_cfg.get("dns") or []
+            dns = [dns_raw] if isinstance(dns_raw, str) else list(dns_raw)
+
+            sysctls_raw = svc_cfg.get("sysctls") or {}
+            sysctls = (
+                {s.split("=", 1)[0]: s.split("=", 1)[1] for s in sysctls_raw if "=" in s}
+                if isinstance(sysctls_raw, list) else dict(sysctls_raw)
+            )
+
+            cpus = svc_cfg.get("cpus")
+            nano_cpus = int(float(cpus) * 1_000_000_000) if cpus else None
+
+            command_raw = svc_cfg.get("command")
+            if isinstance(command_raw, str):
+                command = _shlex.split(command_raw)
+            else:
+                command = command_raw  # list or None
+
+            stop_grace = svc_cfg.get("stop_grace_period")
+            if stop_grace is not None:
+                raw_grace = str(stop_grace).strip().lower()
+                try:
+                    if raw_grace.endswith("ms"):
+                        stop_timeout = max(1, round(float(raw_grace[:-2]) / 1000))
+                    elif raw_grace.endswith("m"):
+                        stop_timeout = round(float(raw_grace[:-1]) * 60)
+                    elif raw_grace.endswith("h"):
+                        stop_timeout = round(float(raw_grace[:-1]) * 3600)
+                    else:
+                        stop_timeout = round(float(raw_grace.rstrip("s")))
+                except ValueError:
+                    raise ValueError(f"Invalid stop_grace_period: {stop_grace}")
+            else:
+                stop_timeout = None
+
+            # ── Create & start ────────────────────────────────────────────────
+            yield emit(f"LOG: [{svc_name}] Creating container '{container_name}'…")
+
+            def _create_start(
+                img=image,               cname=container_name,   cmd=command,
+                env=env_list,            lbl=labels,             ports=exposed_ports_arg,
+                hname=hostname,          wdir=svc_cfg.get("working_dir"),
+                ep=svc_cfg.get("entrypoint"), usr=svc_cfg.get("user"),
+                tty=bool(svc_cfg.get("tty", False)),
+                stdin=bool(svc_cfg.get("stdin_open", False)),
+                pb=port_bindings_arg,    bnd=binds or None,      nm=net_mode,
+                priv=bool(svc_cfg.get("privileged", False)),
+                cap_add=svc_cfg.get("cap_add") or None,
+                cap_drop=svc_cfg.get("cap_drop") or None,
+                dev=devices or None,     _dns=dns or None,
+                dns_search=svc_cfg.get("dns_search") or None,
+                eh=extra_hosts or None,  sc=sysctls or None,
+                memlim=svc_cfg.get("mem_limit") or None,
+                nc=nano_cpus,            tmp=tmpfs,
+                shm=svc_cfg.get("shm_size") or None,
+                ipc=svc_cfg.get("ipc") or None,
+                pid=svc_cfg.get("pid") or None,
+                secopt=svc_cfg.get("security_opt") or None,
+                ro=bool(svc_cfg.get("read_only", False)),
+                runtime=svc_cfg.get("runtime") or None,
+                userns=svc_cfg.get("userns_mode") or None,
+                pids=svc_cfg.get("pids_limit"),
+                oom=bool(svc_cfg.get("oom_kill_disable", False)),
+                ulimits=svc_cfg.get("ulimits") or None,
+                init=bool(svc_cfg.get("init", False)),
+                stop_signal=svc_cfg.get("stop_signal") or None,
+                stop_timeout=stop_timeout,
+                restart=rp,              extra_nets=post_connect_nets,
+            ):
+                c = _make_docker_client(host_url)
+                try:
+                    hcfg = c.api.create_host_config(
+                        port_bindings = pb,
+                        binds         = bnd,
+                        network_mode  = nm,
+                        privileged    = priv,
+                        cap_add       = cap_add,
+                        cap_drop      = cap_drop,
+                        devices       = dev,
+                        dns           = _dns,
+                        dns_search    = dns_search,
+                        extra_hosts   = eh,
+                        sysctls       = sc,
+                        mem_limit     = memlim,
+                        nano_cpus     = nc,
+                        tmpfs         = tmp,
+                        shm_size      = shm,
+                        ipc_mode      = ipc,
+                        pid_mode      = pid,
+                        security_opt  = secopt,
+                        read_only     = ro,
+                        runtime       = runtime,
+                        userns_mode   = userns,
+                        pids_limit    = pids,
+                        oom_kill_disable = oom,
+                        ulimits       = ulimits,
+                        init           = init,
+                        restart_policy= restart,
+                    )
+                    cres = c.api.create_container(
+                        image       = img,
+                        name        = cname,
+                        command     = cmd,
+                        environment = env,
+                        labels      = lbl or None,
+                        ports       = ports or None,
+                        hostname    = hname,
+                        working_dir = wdir or None,
+                        entrypoint  = ep,
+                        user        = usr or None,
+                        tty         = tty,
+                        stdin_open  = stdin,
+                        host_config = hcfg,
+                        stop_signal = stop_signal,
+                        stop_timeout = stop_timeout,
+                    )
+                    cobj = c.containers.get(cres["Id"])
+                    for net_name in extra_nets:
+                        try:
+                            c.networks.get(net_name).connect(cobj)
+                        except Exception as ne:
+                            print(f"[deploy-compose] Warning: could not connect to network {net_name}: {ne}", flush=True)
+                    cobj.start()
+                finally:
+                    c.close()
+
+            try:
+                await asyncio.to_thread(_create_start)
+            except Exception as ce:
+                print(f"[deploy-compose] create/start failed for {svc_name}: {_tb.format_exc()}", flush=True)
+                yield emit(f"DEPLOY_ERROR:[{svc_name}] Failed to create/start '{container_name}': {ce}")
+                return
+
+            yield emit(f"LOG: [{svc_name}] ✓ '{container_name}' is running")
+
+        except Exception as outer:
+            print(f"[deploy-compose] unexpected error for service {svc_name}: {_tb.format_exc()}", flush=True)
+            yield emit(f"DEPLOY_ERROR:[{svc_name}] Unexpected error: {outer}")
+            return
+
+    yield emit("DEPLOY_DONE")
+
+
+@router.post("/docker/backups/{backup_id}/recreate")
+async def recreate_from_backup(backup_id: int, request: Request):
+    """SSE: Restore a container from a stored backup (compose YAML preferred, config_json fallback)."""
+    _verify_token(request)
+
+    db = _SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT container_name, host_id, config_json, compose_yaml FROM container_backups WHERE id=:id"),
+            {"id": backup_id},
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Backup not found.")
+        container_name, host_id, config_json, compose_yaml = row
+
+        hosts = _get_enabled_hosts(db)
+        docker_hosts = [h for h in hosts if h.get("type") != "proxmox"]
+        if not docker_hosts:
+            raise HTTPException(503, "No Docker hosts configured.")
+        host_meta = next((h for h in docker_hosts if h.get("id") == host_id), docker_hosts[0])
+        host_url = host_meta.get("url") or "unix:///var/run/docker.sock"
+        resolved_host_id = host_meta.get("id")
+    finally:
+        db.close()
+
+    async def _stream():
+        def emit(msg: str) -> str:
+            return f"data: {msg}\n\n"
+
+        try:
+            yield emit(f"LOG: [1/4] Preparing to restore '{container_name}' from backup {backup_id}…")
+
+            def _get_current_id():
+                client = _make_docker_client(host_url)
+                try:
+                    matches = [c for c in client.containers.list(all=True)
+                               if c.name.lstrip("/") == container_name]
+                    return matches[0].id if matches else None
+                finally:
+                    client.close()
+
+            current_id = await asyncio.to_thread(_get_current_id)
+
+            if current_id:
+                yield emit("LOG: [1/4] Backing up current container state before restore…")
+                try:
+                    pre_id = await asyncio.to_thread(
+                        _backup_container_sync, container_name, current_id,
+                        host_url, resolved_host_id, "pre_restore",
+                    )
+                    yield emit(f"LOG: [1/4] ✓ Current state backed up (ID {pre_id})")
+                except Exception as be:
+                    yield emit(f"LOG: [1/4] Warning: could not backup current state: {be}")
+            else:
+                yield emit(f"LOG: [1/4] No existing container named '{container_name}' found — creating fresh.")
+
+            has_compose = bool(compose_yaml and not compose_yaml.startswith("# compose generation failed"))
+
+            if has_compose:
+                yield emit("LOG: [2/4] Deploying from stored compose YAML via Docker SDK…")
+                failed = False
+                async for deploy_line in _deploy_compose_stream(compose_yaml, host_url):
+                    # Translate DEPLOY_DONE/DEPLOY_ERROR into RECREATE_ equivalents
+                    if deploy_line.startswith("data: DEPLOY_ERROR:"):
+                        msg = deploy_line[len("data: DEPLOY_ERROR:"):]
+                        yield emit(f"RECREATE_ERROR:{msg.strip()}")
+                        failed = True
+                        break
+                    elif deploy_line.strip() == "data: DEPLOY_DONE":
+                        break
+                    else:
+                        yield deploy_line
+                if failed:
+                    return
+
+            else:
+                if not config_json:
+                    yield emit("RECREATE_ERROR:Backup has no config data to restore from.")
+                    return
+                yield emit("LOG: [2/4] No compose YAML in backup — restoring from inspect config…")
+                attrs = config_json if isinstance(config_json, dict) else json.loads(config_json)
+
+                def _recreate_from_config():
+                    client = _make_docker_client(host_url)
+                    try:
+                        cfg  = attrs.get("Config", {})
+                        hcfg = attrs.get("HostConfig", {})
+                        net_sets = attrs.get("NetworkSettings", {})
+
+                        bak_name = None
+                        try:
+                            cur = client.containers.get(container_name)
+                            if cur.status not in ("exited", "created"):
+                                cur.stop(timeout=15)
+                            ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                            bak_name = f"{container_name}_restore_{ts}"
+                            cur.rename(bak_name)
+                        except docker_sdk.errors.NotFound:
+                            pass
+
+                        port_bindings, exposed_ports = _extract_ports_from_network_settings(
+                            hcfg.get("PortBindings") or net_sets.get("Ports")
+                        )
+                        binds = {}
+                        for bind_spec in (hcfg.get("Binds") or []):
+                            parts = str(bind_spec).split(":")
+                            if len(parts) < 2:
+                                continue
+                            src = ":".join(parts[:-2]) if len(parts) > 2 else parts[0]
+                            dst = parts[-2]
+                            mode = parts[-1] if len(parts) > 2 else "rw"
+                            if src and dst:
+                                binds[src] = {"bind": dst, "mode": mode or "rw"}
+                        if not binds:
+                            for m in (attrs.get("Mounts") or []):
+                                if m.get("Type") == "bind":
+                                    src  = m.get("Source", "")
+                                    dst  = m.get("Destination", "")
+                                    mode = m.get("Mode", "rw")
+                                    if src and dst:
+                                        binds[src] = {"bind": dst, "mode": mode}
+                        vol_binds = {
+                            m["Name"]: {"bind": m["Destination"], "mode": m.get("Mode", "rw")}
+                            for m in (attrs.get("Mounts") or [])
+                            if m.get("Type") == "volume" and m.get("Name") and m.get("Destination")
+                        }
+                        all_binds = {**binds, **vol_binds} or None
+                        rp_raw = hcfg.get("RestartPolicy") or {"Name": "no"}
+                        rp = {
+                            "Name": rp_raw.get("Name", "no") if isinstance(rp_raw, dict) else "no",
+                            "MaximumRetryCount": rp_raw.get("MaximumRetryCount", 0) if isinstance(rp_raw, dict) else 0,
+                        }
+                        net_mode = hcfg.get("NetworkMode", "bridge")
+                        _net_lo = (net_mode or "").lower()
+                        _hostname = (
+                            None if _net_lo in ("host", "none") or _net_lo.startswith("container:")
+                            else (cfg.get("Hostname") or container_name)
+                        )
+                        if _net_lo in ("host", "none") or _net_lo.startswith("container:"):
+                            port_bindings, exposed_ports = None, []
+
+                        try:
+                            _cres = client.api.create_container(
+                                image        = cfg.get("Image"),
+                                name         = container_name,
+                                command      = cfg.get("Cmd"),
+                                environment  = cfg.get("Env"),
+                                labels       = cfg.get("Labels"),
+                                ports        = exposed_ports or list((cfg.get("ExposedPorts") or {}).keys()) or None,
+                                hostname     = _hostname,
+                                working_dir  = cfg.get("WorkingDir") or None,
+                                entrypoint   = cfg.get("Entrypoint"),
+                                user         = cfg.get("User") or None,
+                                tty          = cfg.get("Tty", False),
+                                stdin_open   = cfg.get("OpenStdin", False),
+                                host_config  = client.api.create_host_config(
+                                    port_bindings = port_bindings or None,
+                                    binds         = all_binds,
+                                    volumes_from  = hcfg.get("VolumesFrom") or None,
+                                    network_mode  = net_mode,
+                                    privileged    = hcfg.get("Privileged", False),
+                                    runtime       = hcfg.get("Runtime") or None,
+                                    cap_add       = hcfg.get("CapAdd") or None,
+                                    cap_drop      = hcfg.get("CapDrop") or None,
+                                    devices       = hcfg.get("Devices") or None,
+                                    dns           = hcfg.get("Dns") or None,
+                                    dns_search    = hcfg.get("DnsSearch") or None,
+                                    extra_hosts   = hcfg.get("ExtraHosts") or None,
+                                    sysctls       = hcfg.get("Sysctls") or None,
+                                    mem_limit     = hcfg.get("Memory") or None,
+                                    nano_cpus     = hcfg.get("NanoCpus") or None,
+                                    log_config    = hcfg.get("LogConfig") or None,
+                                    pid_mode      = hcfg.get("PidMode") or None,
+                                    userns_mode   = hcfg.get("UsernsMode") or None,
+                                    security_opt  = hcfg.get("SecurityOpt") or None,
+                                    tmpfs         = hcfg.get("Tmpfs") or None,
+                                    shm_size      = hcfg.get("ShmSize") or None,
+                                    ipc_mode      = hcfg.get("IpcMode") or None,
+                                    read_only     = hcfg.get("ReadonlyRootfs", False),
+                                    restart_policy= rp,
+                                ),
+                            )
+                            new_c = client.containers.get(_cres["Id"])
+                            new_c.start()
+                            if bak_name:
+                                try:
+                                    client.containers.get(bak_name).remove(force=True)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            if bak_name:
+                                try:
+                                    b = client.containers.get(bak_name)
+                                    b.rename(container_name)
+                                    b.start()
+                                except Exception:
+                                    pass
+                            raise
+                    finally:
+                        client.close()
+
+                yield emit("LOG: [3/4] Stopping current container and recreating from config…")
+                await asyncio.to_thread(_recreate_from_config)
+
+            yield emit(f"LOG: [4/4] ✓ Container '{container_name}' restored from backup {backup_id}.")
+            yield emit("RECREATE_DONE")
+
+        except Exception as e:
+            yield emit(f"RECREATE_ERROR:{e}")
+
+    return StreamingResponse(
+        _stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class DeployComposeBody(BaseModel):
+    yaml: str
+
+
+@router.post("/docker/containers/{container_id}/deploy-compose")
+async def deploy_compose_endpoint(container_id: str, body: DeployComposeBody, request: Request):
+    """SSE: Deploy (or redeploy) a container using a user-provided compose YAML."""
+    _verify_token(request)
+    if _parse_proxmox_id(container_id):
+        raise HTTPException(400, "Not available for Proxmox containers.")
+
+    try:
+        import yaml as _yaml
+        _yaml.safe_load(body.yaml)
+    except Exception as e:
+        raise HTTPException(422, f"Invalid YAML: {e}")
+
+    db = _SessionLocal()
+    try:
+        host_url, _, _ = _resolve_host(db, container_id)
+    finally:
+        db.close()
+
+    async def _stream():
+        try:
+            async for line in _deploy_compose_stream(body.yaml, host_url):
+                yield line
+        except Exception as e:
+            import traceback as _tb
+            print(f"[deploy-compose] unhandled stream error: {_tb.format_exc()}", flush=True)
+            yield f"data: DEPLOY_ERROR:Internal error: {e}\n\n"
+
+    return StreamingResponse(
+        _stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 class PinBody(BaseModel):
     pinned: bool
 
@@ -2477,6 +3397,37 @@ async def pin_container(container_id: str, body: PinBody, request: Request):
         container_name = await asyncio.to_thread(_get_name)
         _upsert_update_status(db, container_name, host_id, pinned=body.pinned)
         return {"container_name": container_name, "pinned": body.pinned}
+    finally:
+        db.close()
+
+
+@router.post("/docker/containers/{container_id}/reset-update")
+async def reset_container_update(container_id: str, request: Request):
+    """
+    Clear a stuck update_in_progress flag for a container.
+    Sets has_update=True so the user can immediately retry the update.
+    """
+    _verify_token(request)
+    if _parse_proxmox_id(container_id):
+        raise HTTPException(400, "Update management is not available for Proxmox containers.")
+    db = _SessionLocal()
+    try:
+        host_url, _, host_id = _resolve_host(db, container_id)
+
+        def _get_name():
+            client = _make_docker_client(host_url)
+            try:
+                return client.containers.get(container_id).name.lstrip("/")
+            finally:
+                client.close()
+
+        container_name = await asyncio.to_thread(_get_name)
+        _upsert_update_status(db, container_name, host_id,
+                              update_in_progress=False,
+                              has_update=True,
+                              last_update_status="failed",
+                              last_update_error="Update reset manually — the previous update attempt did not complete.")
+        return {"container_name": container_name, "reset": True}
     finally:
         db.close()
 
@@ -2641,14 +3592,33 @@ async def get_container_networks(container_id: str, request: Request):
         try:
             c        = client.containers.get(container_id)
             hcfg     = c.attrs.get("HostConfig") or {}
+            net_sets = c.attrs.get("NetworkSettings") or {}
             net_mode = hcfg.get("NetworkMode") or "bridge"
             all_nets = [n.name for n in client.networks.list()]
-            return all_nets, net_mode
+
+            # Live network connections from NetworkSettings.Networks — this is
+            # the authoritative current state. NetworkMode is set at creation
+            # time and never updated, so it's stale after any network change.
+            live_nets = list((net_sets.get("Networks") or {}).keys())
+            if net_mode in ("host", "none"):
+                # Special modes aren't in NetworkSettings.Networks
+                current_nets = [net_mode]
+            else:
+                # Use live NetworkSettings.Networks — this is authoritative.
+                # Do NOT fall back to NetworkMode: it's set at creation time and
+                # never updated, so it shows stale data after any network change.
+                current_nets = live_nets  # may be [] if not connected to anything
+
+            return all_nets, current_nets
         finally:
             client.close()
 
-    all_nets, current = await asyncio.to_thread(_fetch)
-    return {"networks": sorted(all_nets), "current": current}
+    all_nets, current_nets = await asyncio.to_thread(_fetch)
+    return {
+        "networks":     sorted(all_nets),
+        "current":      current_nets[0] if current_nets else "",
+        "current_nets": current_nets,
+    }
 
 
 class SetNetworkBody(BaseModel):
@@ -2656,13 +3626,8 @@ class SetNetworkBody(BaseModel):
 
 
 @router.post("/docker/containers/{container_id}/network")
-async def set_container_network(container_id: str, body: SetNetworkBody, request: Request):
-    """
-    Connect a container to a different Docker network.
-    Named networks are switched live (disconnect old, connect new).
-    Switching to/from host or none requires a container recreate and is not
-    supported here — use the update flow instead.
-    """
+async def connect_container_network(container_id: str, body: SetNetworkBody, request: Request):
+    """Connect a container to an additional named network (additive — does not disconnect existing ones)."""
     _verify_token(request)
     db = _SessionLocal()
     try:
@@ -2676,34 +3641,149 @@ async def set_container_network(container_id: str, body: SetNetworkBody, request
     if target_net in ("host", "none"):
         raise HTTPException(
             status_code=400,
-            detail="Switching to host/none requires recreating the container — not supported via this endpoint.",
+            detail="Switching to host/none requires recreating the container.",
         )
 
-    def _switch():
+    def _connect():
         client = _make_docker_client(host_url)
         try:
-            c    = client.containers.get(container_id)
-            hcfg = c.attrs.get("HostConfig") or {}
+            c = client.containers.get(container_id)
             net_sets = c.attrs.get("NetworkSettings") or {}
-            current_nets = list((net_sets.get("Networks") or {}).keys())
-
-            new_net_obj = client.networks.get(target_net)
-            # Connect to new network first so there's no connectivity gap
-            new_net_obj.connect(c)
-            # Disconnect from all previous non-target networks
-            for n in current_nets:
-                if n != target_net:
-                    try:
-                        client.networks.get(n).disconnect(c)
-                    except Exception:
-                        pass
+            already = list((net_sets.get("Networks") or {}).keys())
+            if target_net in already:
+                raise Exception(f"Container is already connected to '{target_net}'.")
+            client.networks.get(target_net).connect(c)
             c.reload()
             return _fmt_container(c)
         finally:
             client.close()
 
-    updated = await asyncio.to_thread(_switch)
+    updated = await asyncio.to_thread(_connect)
     return updated
+
+
+@router.post("/docker/containers/{container_id}/network/disconnect")
+async def disconnect_container_network(container_id: str, body: SetNetworkBody, request: Request):
+    """Disconnect a container from a named network."""
+    _verify_token(request)
+    db = _SessionLocal()
+    try:
+        host_url, _, _ = _resolve_host(db, container_id)
+    finally:
+        db.close()
+
+    target_net = body.network.strip()
+    if not target_net:
+        raise HTTPException(status_code=400, detail="network is required")
+
+    def _disconnect():
+        client = _make_docker_client(host_url)
+        try:
+            c = client.containers.get(container_id)
+            try:
+                client.networks.get(target_net).disconnect(c)
+            except docker_sdk.errors.NotFound:
+                # A deleted Docker network can remain in a stopped container's
+                # inspect metadata. There is no Docker API to edit that stale
+                # endpoint in place, so recreate the container without it.
+                c.reload()
+                attrs = c.attrs or {}
+                net_settings = attrs.get("NetworkSettings") or {}
+                networks = net_settings.get("Networks") or {}
+                if target_net not in networks:
+                    raise
+
+                existing = {n.name for n in client.networks.list()}
+                remaining = [
+                    (name, info) for name, info in networks.items()
+                    if name != target_net and name in existing
+                ]
+                was_running = c.status == "running"
+                config = attrs.get("Config") or {}
+                host_cfg = attrs.get("HostConfig") or {}
+                name = c.name.lstrip("/")
+
+                if was_running:
+                    c.stop(timeout=10)
+                c.remove(force=True)
+
+                port_bindings = {}
+                for port, bindings in (host_cfg.get("PortBindings") or {}).items():
+                    if bindings:
+                        binding = bindings[0]
+                        host_port = binding.get("HostPort")
+                        host_ip = binding.get("HostIp") or ""
+                        if host_port:
+                            port_bindings[port] = (host_ip, int(host_port)) if host_ip else int(host_port)
+                    else:
+                        port_bindings[port] = None
+
+                devices = [
+                    f"{device.get('PathOnHost')}:{device.get('PathInContainer')}:{device.get('CgroupPermissions', 'rwm')}"
+                    for device in (host_cfg.get("Devices") or [])
+                ]
+                restart = host_cfg.get("RestartPolicy") or {}
+                restart_policy = restart if restart.get("Name") else None
+                network_mode = host_cfg.get("NetworkMode") or "bridge"
+                if network_mode not in ("host", "none", "bridge") and network_mode not in existing:
+                    network_mode = "bridge"
+
+                host_config = client.api.create_host_config(
+                    binds=host_cfg.get("Binds") or None,
+                    port_bindings=port_bindings or None,
+                    privileged=bool(host_cfg.get("Privileged")),
+                    runtime=host_cfg.get("Runtime") or None,
+                    cap_add=host_cfg.get("CapAdd") or None,
+                    cap_drop=host_cfg.get("CapDrop") or None,
+                    extra_hosts=host_cfg.get("ExtraHosts") or None,
+                    restart_policy=restart_policy,
+                    network_mode=network_mode,
+                    devices=devices or None,
+                )
+
+                networking_config = None
+                if remaining and network_mode not in ("host", "none"):
+                    first_name, first_info = remaining[0]
+                    aliases = [alias for alias in (first_info.get("Aliases") or []) if alias]
+                    networking_config = client.api.create_networking_config({
+                        first_name: client.api.create_endpoint_config(aliases=aliases)
+                    })
+
+                new_c = client.containers.create(
+                    image=config.get("Image") or attrs.get("Image"),
+                    name=name,
+                    command=config.get("Cmd"),
+                    entrypoint=config.get("Entrypoint"),
+                    environment=config.get("Env"),
+                    labels=config.get("Labels"),
+                    user=config.get("User") or None,
+                    tty=config.get("Tty", False),
+                    stdin_open=config.get("OpenStdin", False),
+                    hostname=None if network_mode in ("host", "none") else config.get("Hostname"),
+                    working_dir=config.get("WorkingDir") or None,
+                    stop_signal=config.get("StopSignal") or None,
+                    ports=list((config.get("ExposedPorts") or {}).keys()) or None,
+                    host_config=host_config,
+                    networking_config=networking_config,
+                )
+                for net_name, info in remaining[1:]:
+                    aliases = [alias for alias in (info.get("Aliases") or []) if alias]
+                    client.api.connect_container_to_network(new_c.id, net_name, aliases=aliases)
+                if was_running:
+                    new_c.start()
+                new_c.reload()
+                return _fmt_container(new_c)
+            c.reload()
+            return _fmt_container(c)
+        finally:
+            client.close()
+
+    try:
+        return await asyncio.to_thread(_disconnect)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 class RestartPolicyBody(BaseModel):

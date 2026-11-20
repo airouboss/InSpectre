@@ -42,6 +42,18 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
+function fmtEventTime(iso) {
+  if (!iso) return ''
+  const d   = new Date(iso)
+  const now = new Date()
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const yesterdayMidnight = new Date(todayMidnight - 86400000)
+  const timeStr = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+  if (d >= todayMidnight) return timeStr
+  if (d >= yesterdayMidnight) return `Yesterday, ${timeStr}`
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }) + ', ' + timeStr
+}
+
 function fmtDateTime(iso) {
   if (!iso) return ''
   return new Date(iso).toLocaleString()
@@ -673,11 +685,12 @@ function PersonDrawer({ person, onClose }) {
       for (let i = 0; i < segs.length; i++) {
         const seg = segs[i]
         const prev = i > 0 ? segs[i - 1] : null
-        if (seg.status === 'home') {
-          const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+        // Only emit a transition event when direction changes (offline→online or online→offline).
+        if (seg.status === 'online' && prev?.status === 'offline') {
+          const awayDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
           evts.push({ type: 'arrived', at: seg.from, detail: awayDur ? `Was away for ${awayDur}` : null })
-        } else if (seg.status === 'away') {
-          const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+        } else if (seg.status === 'offline' && prev?.status === 'online') {
+          const homeDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
           evts.push({ type: 'left', at: seg.from, detail: homeDur ? `Was home for ${homeDur}` : null })
         }
       }
@@ -715,18 +728,22 @@ function PersonDrawer({ person, onClose }) {
           {events.map((e, i) => {
             const cfg = EVENT_ICON[e.type] || EVENT_ICON.arrived
             const { Icon } = cfg
-            const ms = Date.now() - new Date(e.at).getTime()
-            const ago = fmtDuration(ms)
+            const ago = fmtDuration(Date.now() - new Date(e.at).getTime())
+            const timeLabel = fmtEventTime(e.at)
             return (
               <div key={i} className="flex items-start gap-2">
                 <div className="w-5 h-5 rounded-full flex items-center justify-center shrink-0 mt-0.5"
                   style={{ background: `${cfg.color}20`, border: `1px solid ${cfg.color}40` }}>
                   <Icon size={10} style={{ color: cfg.color }} />
                 </div>
-                <div className="min-w-0">
-                  <div className="flex items-baseline gap-1.5">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-baseline justify-between gap-1.5">
                     <span className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{cfg.label}</span>
-                    <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>{ago ? `${ago} ago` : ''}</span>
+                    <span className="text-[10px] shrink-0 tabular-nums"
+                      title={ago ? `${ago} ago` : ''}
+                      style={{ color: 'var(--color-text-muted)', cursor: 'default' }}>
+                      {timeLabel}
+                    </span>
                   </div>
                   {e.detail && (
                     <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>{e.detail}</p>
@@ -973,11 +990,12 @@ function PersonRecentEvents({ persons }) {
         for (let i = 0; i < segs.length; i++) {
           const seg = segs[i]
           const prev = i > 0 ? segs[i - 1] : null
-          if (seg.status === 'home') {
-            const awayDur = prev && prev.status === 'away' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          // Only emit a transition event when direction actually changes.
+          if (seg.status === 'online' && prev?.status === 'offline') {
+            const awayDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
             allEvts.push({ personId: p.id, personName: p.name, type: 'arrived', at: seg.from, detail: awayDur ? `Away for ${awayDur}` : null })
-          } else if (seg.status === 'away') {
-            const homeDur = prev && prev.status === 'home' ? fmtDuration(new Date(seg.from) - new Date(prev.from)) : null
+          } else if (seg.status === 'offline' && prev?.status === 'online') {
+            const homeDur = fmtDuration(new Date(seg.from) - new Date(prev.from))
             allEvts.push({ personId: p.id, personName: p.name, type: 'left', at: seg.from, detail: homeDur ? `Home for ${homeDur}` : null })
           }
         }
@@ -1017,9 +1035,8 @@ function PersonRecentEvents({ persons }) {
           {events.map((e, i) => {
             const cfg = EVENT_CFG[e.type] || EVENT_CFG.arrived
             const { Icon } = cfg
-            const p = personMap[e.personId]
-            const ms = Date.now() - new Date(e.at).getTime()
-            const ago = fmtDuration(ms)
+            const ago = fmtDuration(Date.now() - new Date(e.at).getTime())
+            const timeLabel = fmtEventTime(e.at)
             return (
               <div key={i} className="flex items-center gap-3">
                 <div className="w-6 h-6 rounded-full flex items-center justify-center shrink-0"
@@ -1031,8 +1048,10 @@ function PersonRecentEvents({ persons }) {
                   <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>{cfg.label}</span>
                   {e.detail && <span className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>· {e.detail}</span>}
                 </div>
-                <span className="text-[10px] shrink-0" style={{ color: 'var(--color-text-faint)' }}>
-                  {ago ? `${ago} ago` : ''}
+                <span className="text-[10px] tabular-nums shrink-0"
+                  title={ago ? `${ago} ago` : ''}
+                  style={{ color: 'var(--color-text-faint)', cursor: 'default' }}>
+                  {timeLabel}
                 </span>
               </div>
             )

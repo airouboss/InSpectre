@@ -34,6 +34,14 @@ async function request(method, path, body) {
     } catch (_) {
       try { detail = await res.text() } catch (_) { detail = '' }
     }
+    if (detail && typeof detail !== 'string') {
+      detail = Array.isArray(detail)
+        ? detail.map(item => {
+            const location = item?.loc ? `${item.loc.join('.')}: ` : ''
+            return `${location}${item?.msg || JSON.stringify(item)}`
+          }).join('; ')
+        : JSON.stringify(detail)
+    }
     throw new Error(detail
       ? `${method} ${path} \u2192 ${res.status}: ${detail}`
       : `${method} ${path} \u2192 ${res.status}`)
@@ -367,7 +375,15 @@ export const api = {
   // Docker container monitoring
   dockerStats:            ()              => request('GET',  '/docker/stats'),
   dockerContainers:       ()              => request('GET',  '/docker/containers'),
+  dockerCreate:           (body)         => request('POST', '/docker/containers', body),
   dockerContainer:        (id)            => request('GET',  `/docker/containers/${id}`),
+  dockerConsoleUrl:       (id, hostId, shell) => {
+    const url = new URL(`${BASE.replace(/\/$/, '')}/docker/containers/${encodeURIComponent(id)}/console`, window.location.href)
+    url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    if (hostId != null) url.searchParams.set('host_id', hostId)
+    if (shell) url.searchParams.set('shell', shell)
+    return url.toString()
+  },
   dockerStart:            (id)            => request('POST', `/docker/containers/${id}/start`),
   dockerStop:             (id)            => request('POST', `/docker/containers/${id}/stop`),
   dockerRestart:          (id)            => request('POST', `/docker/containers/${id}/restart`),
@@ -377,9 +393,12 @@ export const api = {
   dockerTrivyScan:        (id, onLine, signal)       => streamSSE(`/docker/containers/${id}/trivy-scan`, onLine, signal),
   dockerCompose:          (id)                       => request('GET',  `/docker/containers/${id}/compose`),
   dockerContainerNetworks:(id)            => request('GET',  `/docker/containers/${id}/networks`),
-  dockerSetNetwork:       (id, network)   => request('POST', `/docker/containers/${id}/network`, { network }),
+  dockerConnectNetwork:    (id, network)   => request('POST', `/docker/containers/${id}/network`, { network }),
+  dockerDisconnectNetwork: (id, network)   => request('POST', `/docker/containers/${id}/network/disconnect`, { network }),
+  dockerSetNetwork:        (id, network)   => request('POST', `/docker/containers/${id}/network`, { network }),
   dockerSetRestartPolicy: (id, name, maximum_retry_count = 0) => request('POST', `/docker/containers/${id}/restart-policy`, { name, maximum_retry_count }),
   dockerAutoScanResult:   (name)      => request('GET',  `/docker/auto-scan/${encodeURIComponent(name)}`),
+  dockerSecurityState:    (id)        => request('GET',  `/docker/containers/${id}/security-state`),
   dockerVulnSummary:      ()          => request('GET',  '/docker/vuln-summary'),
   dockerScanAll:          ()          => request('POST', '/docker/scan-all'),
   getContainerTimeline:   (days)      => request('GET',  `/docker/timeline?days=${days}`),
@@ -388,11 +407,14 @@ export const api = {
   dockerUpdateStatus:       ()                       => request('GET',  '/docker/update-status'),
   dockerContainerUpdateStatus: (id)                  => request('GET',  `/docker/containers/${id}/update-status`),
   dockerCheckUpdate:        (id)                     => request('POST', `/docker/containers/${id}/check-update`),
+  dockerResetUpdate:        (id)                     => request('POST', `/docker/containers/${id}/reset-update`),
   dockerScanNewImage:       (id, onLine, signal)     => streamSSEPost(`/docker/containers/${id}/scan-new-image`, {}, onLine, signal),
   dockerSafeUpdate:         (id, body, onLine, signal) => streamSSEPost(`/docker/containers/${id}/safe-update`, body, onLine, signal),
   dockerBackupContainer:    (id)                     => request('POST', `/docker/containers/${id}/backup`),
   dockerListBackups:        (id)                     => request('GET',  `/docker/containers/${id}/backups`),
   dockerGetBackupCompose:   (bid)                    => request('GET',  `/docker/backups/${bid}/compose`),
+  dockerRecreateFromBackup: (bid, onLine, signal)    => streamSSEPost(`/docker/backups/${bid}/recreate`, {}, onLine, signal),
+  dockerDeployCompose:      (id, yaml, onLine, signal) => streamSSEPost(`/docker/containers/${id}/deploy-compose`, { yaml }, onLine, signal),
   dockerPinContainer:       (id, pinned)             => request('POST', `/docker/containers/${id}/pin`, { pinned }),
   dockerCheckAllUpdates:    ()                       => request('POST', '/docker/check-all-updates'),
   dockerCheckAllStatus:     ()                       => request('GET',  '/docker/check-all-status'),

@@ -1,13 +1,39 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { Component, useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react'
 import {
   X, Box, Play, Square, RotateCcw, ChevronDown, ChevronRight,
   Network, HardDrive, Tag, Terminal, ShieldAlert, ShieldCheck,
   Settings2, Clock, ExternalLink, Eye, EyeOff, Loader2, FileText, Download, FileDown,
   Copy, Check, GitMerge, Info, Trash2, RotateCw, AlertTriangle,
   RefreshCw, ArrowUpCircle, Shield, Pin, PinOff, Database,
+  Pencil, Save, Upload,
 } from 'lucide-react'
 import { api } from '../api'
 import { exportContainerVulnPDF } from '../utils/vulnPdfExport'
+
+const ContainerConsole = lazy(() => import('./ContainerConsole'))
+
+class ConsoleErrorBoundary extends Component {
+  state = { errorMessage: null }
+
+  static getDerivedStateFromError(error) {
+    return { errorMessage: error?.message || 'Unknown rendering error.' }
+  }
+
+  componentDidCatch(error) {
+    console.error('Container console failed to render:', error)
+  }
+
+  render() {
+    if (this.state.errorMessage) {
+      return (
+        <div className="text-sm text-red-400">
+          The container console could not be displayed: {this.state.errorMessage}
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
 
 const STATUS_CONFIG = {
   running:    { color: '#22c55e', bg: 'rgba(34,197,94,0.12)',   border: 'rgba(34,197,94,0.3)',   label: 'Running'    },
@@ -57,7 +83,8 @@ const TABS = [
   { id: 'overview', label: 'Overview'  },
   { id: 'compose',  label: 'Compose'   },
   { id: 'logs',     label: 'Logs'      },
-  { id: 'vuln',     label: 'Vuln Scan' },
+  { id: 'console',  label: 'Console'   },
+  { id: 'vuln',     label: 'Security'  },
   { id: 'updates',  label: 'Updates'   },
   { id: 'admin',    label: 'Admin'     },
 ]
@@ -235,6 +262,7 @@ const SEV_CFG = {
   high:     { label: 'High',     color: '#f97316', bg: 'rgba(249,115,22,0.12)', border: 'rgba(249,115,22,0.3)' },
   medium:   { label: 'Medium',   color: '#f59e0b', bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.3)' },
   low:      { label: 'Low',      color: '#3b82f6', bg: 'rgba(59,130,246,0.12)', border: 'rgba(59,130,246,0.3)' },
+  info:     { label: 'Info',     color: '#22c55e', bg: 'rgba(34,197,94,0.12)',  border: 'rgba(34,197,94,0.3)'  },
   unknown:  { label: 'Unknown',  color: '#8b5cf6', bg: 'rgba(139,92,246,0.12)', border: 'rgba(139,92,246,0.3)' },
 }
 const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'unknown']
@@ -321,45 +349,96 @@ function VulnGroup({ severity, vulns, defaultOpen }) {
   )
 }
 
-// ---------------------------------------------------------------------------
-// Vuln scan tab (Trivy) — state is lifted to ContainersPage
-// ---------------------------------------------------------------------------
-function VulnTab({ container, trivyScan, updateTrivyScan }) {
-  const abortRef        = useRef(null)
-  const [loadingHistory, setLoadingHistory] = useState(false)
+function SecurityAuditFindingCard({ finding }) {
+  const cfg = SEV_CFG[finding.severity] || SEV_CFG.unknown
+  return (
+    <div className="rounded-lg border p-3 space-y-2" style={{ borderColor: cfg.border, background: cfg.bg }}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded"
+            style={{ background: 'rgba(0,0,0,0.2)', color: cfg.color }}>
+            {cfg.label.toUpperCase()}
+          </span>
+          <p className="mt-2 text-xs leading-snug" style={{ color: 'var(--color-text)' }}>{finding.description}</p>
+        </div>
+        <span className="text-[10px] font-mono shrink-0" style={{ color: 'var(--color-text-faint)' }}>
+          {finding.id}
+        </span>
+      </div>
+      <p className="text-[11px] leading-snug" style={{ color: 'var(--color-text-muted)' }}>
+        <strong>Advice:</strong> {finding.advice}
+      </p>
+    </div>
+  )
+}
 
-  const logs      = trivyScan.logs || []
-  const vulns     = trivyScan.vulns     // null = never scanned, [] = clean, [...] = found
-  const scanning  = trivyScan.scanning
+// ---------------------------------------------------------------------------
+// Security tab (Trivy + runtime audit) — Trivy state is lifted to ContainersPage
+// ---------------------------------------------------------------------------
+function SecurityTab({ container, trivyScan, updateTrivyScan }) {
+  const abortRef = useRef(null)
+  const [loadingSecurity, setLoadingSecurity] = useState(false)
+  const [audit, setAudit] = useState(null)
+  const isProxmox = container.host_type === 'proxmox'
+
+  const logs = trivyScan.logs || []
+  const vulns = trivyScan.vulns
+  const scanning = trivyScan.scanning
   const scannedAt = trivyScan.scannedAt
+  const scanSource = trivyScan.source || null
+  const stale = trivyScan.stale || null
 
-  // On first open, load stored result from backend
-  useEffect(() => {
-    if (vulns !== null || scanning) return
-    setLoadingHistory(true)
-    api.dockerAutoScanResult(container.name).then(data => {
-      if (data && Array.isArray(data.vulns)) {
-        updateTrivyScan({ vulns: data.vulns, scannedAt: data.scanned_at || null })
+  const loadSecurityState = useCallback((force = false) => {
+    if (loadingSecurity && !force) return
+    setLoadingSecurity(true)
+    api.dockerSecurityState(container.id).then(data => {
+      const imageScan = data?.image_scan
+      if (imageScan) {
+        updateTrivyScan(cur => ({
+          ...cur,
+          vulns: Array.isArray(imageScan.vulns) ? imageScan.vulns : null,
+          scannedAt: imageScan.scanned_at || null,
+          source: imageScan.source || null,
+          stale: imageScan.stale || null,
+        }))
       }
-    }).catch(() => {}).finally(() => setLoadingHistory(false))
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+      setAudit(data?.audit || null)
+    }).catch(err => {
+      setAudit({ findings: [], error: err.message || 'Failed to load security state.' })
+    }).finally(() => setLoadingSecurity(false))
+  }, [container.id, loadingSecurity, updateTrivyScan])
+
+  useEffect(() => {
+    if (scanning) return
+    loadSecurityState(true)
+  }, [container.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function startScan() {
+    if (isProxmox) return
     if (abortRef.current) abortRef.current.abort()
     const ctrl = new AbortController()
     abortRef.current = ctrl
-    updateTrivyScan({ logs: [], vulns: null, scanning: true, scannedAt: null })
+    updateTrivyScan({ logs: [], vulns: null, scanning: true, scannedAt: null, source: null, stale: null })
     api.dockerTrivyScan(container.id, (line) => {
       if (line.startsWith('TRIVY_RESULT:')) {
         try {
           const payload = JSON.parse(line.slice('TRIVY_RESULT:'.length))
-          updateTrivyScan(cur => ({ ...cur, vulns: payload.vulns || [], scannedAt: payload.scanned_at || null }))
-        } catch (_) { /* ignore parse errors */ }
+          updateTrivyScan(cur => ({
+            ...cur,
+            vulns: payload.vulns || [],
+            scannedAt: payload.scanned_at || null,
+            source: 'manual_scan',
+            stale: null,
+          }))
+        } catch (_) {}
       } else if (line !== 'TRIVY_DONE') {
         const msg = line.startsWith('LOG: ') ? line.slice(5) : line
         updateTrivyScan(cur => ({ ...cur, logs: [...(cur.logs || []).slice(-199), msg] }))
       }
-    }, ctrl.signal).catch(() => {}).finally(() => updateTrivyScan(cur => ({ ...cur, scanning: false })))
+    }, ctrl.signal).catch(() => {}).finally(() => {
+      updateTrivyScan(cur => ({ ...cur, scanning: false }))
+      loadSecurityState(true)
+    })
   }
 
   function stopScan() {
@@ -375,44 +454,58 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
     grouped[s].push(v)
   }
   const hasVulns = vulns !== null && vulns.length > 0
+  const auditFindings = (audit?.findings || []).slice().sort((a, b) => {
+    const order = { critical: 0, high: 1, medium: 2, info: 3 }
+    return (order[a.severity] ?? 9) - (order[b.severity] ?? 9)
+  })
 
   return (
     <div className="space-y-4">
-      {/* Image info + scan timestamp */}
       <div className="rounded-lg px-4 py-3 text-xs space-y-1"
         style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
         <p className="font-medium" style={{ color: 'var(--color-text)' }}>
-          Image: <span className="font-mono">{container.image}</span>
+          {isProxmox ? 'Guest' : 'Image'}: <span className="font-mono">{container.image}</span>
         </p>
-        {scannedAt && !scanning && (
-          <p style={{ color: 'var(--color-text-faint)' }}>Last scanned: {new Date(scannedAt).toLocaleString()}</p>
+        {!isProxmox && scannedAt && !scanning && (
+          <p style={{ color: 'var(--color-text-faint)' }}>
+            Last image scan: {new Date(scannedAt).toLocaleString()}
+            {scanSource ? ` · ${scanSource.replaceAll('_', ' ')}` : ''}
+          </p>
         )}
-        {!scannedAt && !scanning && vulns === null && (
-          <p style={{ color: 'var(--color-text-faint)' }}>Scans the container image for known CVEs using Trivy.</p>
+        {!isProxmox && stale?.scanned_at && vulns === null && (
+          <p style={{ color: '#f59e0b' }}>
+            Previous scan data exists for a different image ({stale.image || 'unknown image'}), so it is not shown as the current result.
+          </p>
+        )}
+        {audit?.scanned_at && (
+          <p style={{ color: 'var(--color-text-faint)' }}>
+            Last runtime audit: {new Date(audit.scanned_at).toLocaleString()}
+          </p>
         )}
       </div>
 
-      {/* Controls */}
-      <div className="flex items-center gap-2">
-        {scanning ? (
-          <button onClick={stopScan}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
-                       border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors">
-            <Square size={11} className="fill-current" /> Stop Scan
-          </button>
-        ) : (
-          <button onClick={startScan}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
-                       border-brand/40 bg-brand/10 text-brand hover:bg-brand/20 transition-colors">
-            <ShieldAlert size={11} /> {vulns !== null ? 'Re-scan' : 'Scan Image'}
-          </button>
+      <div className="flex items-center gap-2 flex-wrap">
+        {!isProxmox && (
+          scanning ? (
+            <button onClick={stopScan}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
+                         border-red-500/40 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors">
+              <Square size={11} className="fill-current" /> Stop Scan
+            </button>
+          ) : (
+            <button onClick={startScan}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border
+                         border-brand/40 bg-brand/10 text-brand hover:bg-brand/20 transition-colors">
+              <ShieldAlert size={11} /> {vulns !== null ? 'Re-scan Image' : 'Scan Image'}
+            </button>
+          )
         )}
-        {scanning && (
-          <span className="flex items-center gap-1 text-xs" style={{ color: 'var(--color-text-faint)' }}>
-            <Loader2 size={11} className="animate-spin" />Scanning…
-          </span>
-        )}
-        {vulns !== null && !scanning && (
+        <button onClick={() => loadSecurityState(true)} disabled={loadingSecurity || scanning}
+          className="btn-ghost flex items-center gap-1.5 text-xs">
+          <RefreshCw size={12} className={loadingSecurity ? 'animate-spin' : ''} />
+          Refresh Security
+        </button>
+        {!isProxmox && vulns !== null && !scanning && (
           <button
             onClick={() => exportContainerVulnPDF(container, vulns, scannedAt)}
             className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs font-medium transition-colors ml-auto"
@@ -423,7 +516,6 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
         )}
       </div>
 
-      {/* Scan errors/warnings only — INFO lines suppressed */}
       {logs.some(l => l.includes('[ERROR]') || l.includes('[WARN]')) && (
         <div className="rounded-lg p-3 font-mono text-[11px] space-y-0.5"
           style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
@@ -436,55 +528,139 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
         </div>
       )}
 
-      {/* Loading history */}
-      {loadingHistory && (
-        <div className="flex items-center gap-2 text-xs py-4" style={{ color: 'var(--color-text-faint)' }}>
-          <Loader2 size={13} className="animate-spin" /> Loading last scan result…
+      {audit?.error && (
+        <div className="rounded-lg p-3 text-xs"
+          style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)', color: '#ef4444' }}>
+          Runtime security audit failed: {audit.error}
         </div>
       )}
 
-      {/* Not-yet-scanned empty state */}
-      {vulns === null && !scanning && !loadingHistory && (
-        <div className="flex flex-col items-center py-10 gap-2 text-center">
-          <ShieldAlert size={24} style={{ color: 'var(--color-text-faint)' }} />
-          <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
-            Click "Scan Image" to check for known CVEs with Trivy.
-          </p>
+      {loadingSecurity && (
+        <div className="flex items-center gap-2 text-xs py-2" style={{ color: 'var(--color-text-faint)' }}>
+          <Loader2 size={13} className="animate-spin" /> Loading security data…
         </div>
       )}
 
-      {/* Results */}
-      {vulns !== null && !scanning && (
-        <>
-          {hasVulns ? (
-            <div className="flex flex-wrap gap-2">
-              {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => {
-                const cfg = SEV_CFG[s]
-                return (
-                  <span key={s} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
-                    style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}` }}>
-                    <span className="text-base font-bold tabular-nums">{grouped[s].length}</span> {cfg.label}
-                  </span>
-                )
-              })}
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 px-4 py-3 rounded-lg text-xs font-medium"
-              style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
-              <ShieldCheck size={14} /> No vulnerabilities found in this image
+      {!isProxmox && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <ShieldAlert size={13} style={{ color: 'var(--color-brand)' }} />
+            <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
+              Image Vulnerability Scan
+            </span>
+          </div>
+
+          {vulns === null && !scanning && !loadingSecurity && (
+            <div className="flex flex-col items-center py-8 gap-2 text-center">
+              <ShieldAlert size={24} style={{ color: 'var(--color-text-faint)' }} />
+              <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                {stale?.scanned_at
+                  ? 'No scan result is stored for the current running image yet.'
+                  : 'Click "Scan Image" to check the current running image for known CVEs with Trivy.'}
+              </p>
             </div>
           )}
 
-          {hasVulns && (
-            <div>
-              {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => (
-                <VulnGroup key={s} severity={s} vulns={grouped[s]}
-                  defaultOpen={s === 'critical' || s === 'high'} />
-              ))}
-            </div>
+          {vulns !== null && !scanning && (
+            <>
+              {hasVulns ? (
+                <div className="flex flex-wrap gap-2">
+                  {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => {
+                    const cfg = SEV_CFG[s]
+                    return (
+                      <span key={s} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
+                        style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}` }}>
+                        <span className="text-base font-bold tabular-nums">{grouped[s].length}</span> {cfg.label}
+                      </span>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 px-4 py-3 rounded-lg text-xs font-medium"
+                  style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
+                  <ShieldCheck size={14} /> No vulnerabilities found in the current running image
+                </div>
+              )}
+
+              {hasVulns && (
+                <div>
+                  {SEV_ORDER.filter(s => grouped[s].length > 0).map(s => (
+                    <VulnGroup key={s} severity={s} vulns={grouped[s]}
+                      defaultOpen={s === 'critical' || s === 'high'} />
+                  ))}
+                </div>
+              )}
+            </>
           )}
-        </>
+        </div>
       )}
+
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <Shield size={13} style={{ color: 'var(--color-brand)' }} />
+          <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-muted)' }}>
+            Runtime Security Audit
+          </span>
+        </div>
+
+        {!loadingSecurity && audit && auditFindings.length === 0 && !audit.error && (
+          <div className="flex items-center gap-2 px-4 py-3 rounded-lg text-xs font-medium"
+            style={{ background: 'rgba(34,197,94,0.1)', color: '#22c55e', border: '1px solid rgba(34,197,94,0.25)' }}>
+            <ShieldCheck size={14} /> No common runtime misconfigurations were detected
+          </div>
+        )}
+
+        {auditFindings.length > 0 && (
+          <div className="space-y-2">
+            {auditFindings.map((finding, idx) => (
+              <SecurityAuditFindingCard key={`${finding.id}-${idx}`} finding={finding} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// YAML viewer modal
+// ---------------------------------------------------------------------------
+function YamlViewModal({ title, yaml, onClose }) {
+  const [copied, setCopied] = useState(false)
+
+  function handleCopy() {
+    navigator.clipboard.writeText(yaml).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.6)' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="rounded-xl shadow-2xl flex flex-col w-full max-w-2xl"
+        style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', maxHeight: '85vh' }}>
+        <div className="flex items-center justify-between px-4 py-3 border-b shrink-0"
+          style={{ borderColor: 'var(--color-border)' }}>
+          <span className="text-sm font-semibold" style={{ color: 'var(--color-text)' }}>{title}</span>
+          <div className="flex items-center gap-2">
+            <button onClick={handleCopy}
+              className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+              {copied ? <Check size={11} /> : <Copy size={11} />}
+              {copied ? 'Copied!' : 'Copy'}
+            </button>
+            <button onClick={onClose} className="btn-ghost p-1">
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+        <pre className="flex-1 overflow-auto p-4 text-[11px] font-mono leading-relaxed"
+          style={{ color: 'var(--color-text)', whiteSpace: 'pre' }}>
+          {yaml}
+        </pre>
+      </div>
     </div>
   )
 }
@@ -493,55 +669,173 @@ function VulnTab({ container, trivyScan, updateTrivyScan }) {
 // Compose tab
 // ---------------------------------------------------------------------------
 function ComposeTab({ containerId, containerName, labels, resolveCurrentContainerId }) {
-  const [data,     setData]     = useState(null)
-  const [loading,  setLoading]  = useState(false)
-  const [error,    setError]    = useState(null)
-  const [copied,   setCopied]   = useState(false)
+  const [data,          setData]          = useState(null)
+  const [loading,       setLoading]       = useState(false)
+  const [error,         setError]         = useState(null)
+  const [copied,        setCopied]        = useState(false)
+
+  // Edit + deploy state
+  const [editMode,      setEditMode]      = useState(false)
+  const [editYaml,      setEditYaml]      = useState('')
+  const [deployLogs,    setDeployLogs]    = useState([])
+  const [deploying,     setDeploying]     = useState(false)
+  const deployAbortRef = useRef(null)
+
+  // Backup state
+  const [backups,       setBackups]       = useState(null)
+  const [showBackups,   setShowBackups]   = useState(false)
+  const [confirmRestore, setConfirmRestore] = useState(null)
+  const [restoring,     setRestoring]     = useState(false)
+  const [restoreLogs,   setRestoreLogs]   = useState([])
+  const restoreAbortRef = useRef(null)
+
+  // YAML viewer modal
+  const [viewYaml,      setViewYaml]      = useState(null) // { title, yaml }
+  const resolveRef = useRef(resolveCurrentContainerId)
 
   useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      setLoading(true)
-      try {
-        const res = await api.dockerCompose(containerId)
-        if (!cancelled) { setData(res); setError(null) }
-      } catch (e) {
-        const msg = String(e?.message || '')
-        if (msg.includes('404') && resolveCurrentContainerId) {
-          try {
-            const resolved = await resolveCurrentContainerId()
-            if (resolved) {
-              const res2 = await api.dockerCompose(resolved)
-              if (!cancelled) { setData(res2); setError(null) }
-              return
-            }
-          } catch (_) {}
+    resolveRef.current = resolveCurrentContainerId
+  }, [resolveCurrentContainerId])
+
+  const loadCompose = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await api.dockerCompose(containerId)
+      setData(res)
+      setError(null)
+    } catch (e) {
+      const msg = String(e?.message || '')
+      // 404 can happen if the container was recreated with a new ID; fall back
+      // to resolving the current live container exactly once.
+      if (msg.includes('404') && resolveRef.current && typeof resolveRef.current === 'function') {
+        try {
+          const resolved = await resolveRef.current()
+          if (resolved) {
+            const res2 = await api.dockerCompose(resolved)
+            setData(res2)
+            setError(null)
+            return
+          }
+        } catch (_) {
+          // Let the original error surface below.
         }
-        if (!cancelled) setError(e.message || 'Failed to generate compose file')
-      } finally {
-        if (!cancelled) setLoading(false)
       }
-    })()
-    return () => { cancelled = true }
+      setError(e.message || 'Failed to generate compose file')
+    } finally {
+      setLoading(false)
+    }
   }, [containerId])
 
+  // Load compose on mount or when containerId changes.
+  useEffect(() => {
+    loadCompose().catch(() => {})
+  }, [loadCompose])
+
   function handleCopy() {
-    if (!data?.yaml) return
-    navigator.clipboard.writeText(data.yaml).then(() => {
+    const yaml = editMode ? editYaml : data?.yaml
+    if (!yaml) return
+    navigator.clipboard.writeText(yaml).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
   }
 
   function handleDownload() {
-    if (!data?.yaml) return
-    const blob = new Blob([data.yaml], { type: 'text/yaml' })
+    const yaml = editMode ? editYaml : data?.yaml
+    if (!yaml) return
+    const blob = new Blob([yaml], { type: 'text/yaml' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
     a.href     = url
     a.download = `${containerName || 'container'}-compose.yml`
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  function handleEdit() {
+    setEditYaml(data?.yaml || '')
+    setEditMode(true)
+    setDeployLogs([])
+  }
+
+  function handleCancelEdit() {
+    setEditMode(false)
+    setDeployLogs([])
+    if (deployAbortRef.current) deployAbortRef.current.abort()
+  }
+
+  function handleDeploy() {
+    if (deploying) return
+    setDeployLogs([])
+    setDeploying(true)
+    const ctrl = new AbortController()
+    deployAbortRef.current = ctrl
+    api.dockerDeployCompose(containerId, editYaml, line => {
+      if (line.startsWith('DEPLOY_ERROR:')) {
+        setDeployLogs(l => [...l, '❌ ' + line.slice(13)])
+        setDeploying(false)
+      } else if (line === 'DEPLOY_DONE') {
+        setDeployLogs(l => [...l, '✅ Deployed successfully.'])
+        setDeploying(false)
+        loadCompose().catch(() => {})
+      } else {
+        setDeployLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+      }
+    }, ctrl.signal).catch(e => {
+      setDeployLogs(l => [...l, `❌ ${e.message || 'Deploy failed'}`])
+      setDeploying(false)
+    })
+  }
+
+  async function loadBackups() {
+    try {
+      const b = await api.dockerListBackups(containerId)
+      setBackups(b)
+    } catch (_) {}
+  }
+
+  async function manualBackup() {
+    try {
+      await api.dockerBackupContainer(containerId)
+      loadBackups()
+    } catch (_) {}
+  }
+
+  function downloadBackupCompose(backupId, name) {
+    api.dockerGetBackupCompose(backupId).then(res => {
+      const blob = new Blob([res.compose_yaml], { type: 'text/yaml' })
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a'); a.href = url
+      a.download = `${name}_backup_${backupId}.yaml`
+      a.click(); URL.revokeObjectURL(url)
+    }).catch(() => {})
+  }
+
+  function viewBackupCompose(backupId, name) {
+    api.dockerGetBackupCompose(backupId).then(res => {
+      setViewYaml({ title: `Backup #${backupId} — ${name}`, yaml: res.compose_yaml })
+    }).catch(() => {})
+  }
+
+  function startRestoreStream(backupId) {
+    if (restoring) return
+    setConfirmRestore(null)
+    setRestoreLogs([])
+    setRestoring(true)
+    const ctrl = new AbortController()
+    restoreAbortRef.current = ctrl
+    api.dockerRecreateFromBackup(backupId, line => {
+      if (line.startsWith('RECREATE_ERROR:')) {
+        setRestoreLogs(l => [...l, '❌ ' + line.slice(15)])
+        setRestoring(false)
+      } else if (line === 'RECREATE_DONE') {
+        setRestoreLogs(l => [...l, '✅ Container restored successfully.'])
+        setRestoring(false)
+        loadBackups()
+      } else {
+        setRestoreLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+      }
+    }, ctrl.signal).catch(() => setRestoring(false))
   }
 
   if (loading) return (
@@ -560,6 +854,10 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
 
   return (
     <div className="space-y-3">
+      {viewYaml && (
+        <YamlViewModal title={viewYaml.title} yaml={viewYaml.yaml} onClose={() => setViewYaml(null)} />
+      )}
+
       {/* Origin notice */}
       {data.compose_managed ? (
         <div className="flex items-start gap-2 rounded-lg px-3 py-2.5 text-xs"
@@ -584,6 +882,13 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
           docker-compose.yml
         </span>
         <div className="flex items-center gap-2">
+          {!editMode && (
+            <button onClick={handleEdit}
+              className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
+              style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
+              <Pencil size={11} /> Edit
+            </button>
+          )}
           <button onClick={handleCopy}
             className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border transition-colors"
             style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
@@ -598,11 +903,123 @@ function ComposeTab({ containerId, containerName, labels, resolveCurrentContaine
         </div>
       </div>
 
-      {/* YAML block */}
-      <pre className="rounded-lg p-4 text-[11px] font-mono overflow-x-auto leading-relaxed"
-        style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text)', border: '1px solid var(--color-border)', whiteSpace: 'pre', maxHeight: '60vh', overflowY: 'auto' }}>
-        {data.yaml}
-      </pre>
+      {/* YAML block or editor */}
+      {editMode ? (
+        <div className="space-y-2">
+          <textarea
+            value={editYaml}
+            onChange={e => setEditYaml(e.target.value)}
+            spellCheck={false}
+            className="w-full rounded-lg p-4 text-[11px] font-mono leading-relaxed resize-none focus:outline-none"
+            style={{
+              background: 'var(--color-surface-offset)', color: 'var(--color-text)',
+              border: '1px solid var(--color-brand)', minHeight: '40vh', maxHeight: '60vh',
+            }}
+          />
+          <div className="flex items-center justify-between gap-2">
+            <button onClick={handleCancelEdit} disabled={deploying}
+              className="btn-ghost text-xs px-3 py-1.5 flex items-center gap-1">
+              <X size={11} /> Cancel
+            </button>
+            <button onClick={handleDeploy} disabled={deploying || !editYaml.trim()}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-semibold transition-colors"
+              style={{ background: 'var(--color-brand)', color: '#fff', opacity: deploying ? 0.6 : 1 }}>
+              {deploying ? <Loader2 size={11} className="animate-spin" /> : <Upload size={11} />}
+              {deploying ? 'Deploying…' : 'Save & Deploy'}
+            </button>
+          </div>
+          {deployLogs.length > 0 && (
+            <div className="rounded-lg p-3 space-y-0.5 text-[11px] font-mono"
+              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', maxHeight: '20vh', overflowY: 'auto' }}>
+              {deployLogs.map((l, i) => <div key={i} style={{ color: 'var(--color-text-muted)' }}>{l}</div>)}
+            </div>
+          )}
+        </div>
+      ) : (
+        <pre className="rounded-lg p-4 text-[11px] font-mono overflow-x-auto leading-relaxed"
+          style={{ background: 'var(--color-surface-offset)', color: 'var(--color-text)', border: '1px solid var(--color-border)', whiteSpace: 'pre', maxHeight: '60vh', overflowY: 'auto' }}>
+          {data.yaml}
+        </pre>
+      )}
+
+      {/* Backup history */}
+      <div className="card p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <button
+            className="flex items-center gap-1.5 text-sm font-semibold"
+            style={{ color: 'var(--color-text)' }}
+            onClick={() => { setShowBackups(v => !v); if (!backups) loadBackups() }}>
+            <Database size={14} style={{ color: 'var(--color-brand)' }} />
+            Backup History
+            {showBackups ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </button>
+          <button onClick={manualBackup}
+            className="btn-ghost flex items-center gap-1 text-[11px]"
+            title="Save a manual backup of the current compose config">
+            <Save size={11} /> Backup Now
+          </button>
+        </div>
+        {showBackups && (
+          <div className="space-y-1.5">
+            {backups === null && <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>Loading…</p>}
+            {backups?.length === 0 && <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>No backups yet.</p>}
+            {backups?.map(b => (
+              <div key={b.id} className="flex items-center justify-between gap-2 text-xs py-1.5 border-b"
+                style={{ borderColor: 'var(--color-border)' }}>
+                <div className="min-w-0">
+                  <span className="font-mono text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
+                    {b.backed_up_at ? new Date(b.backed_up_at).toLocaleString() : '—'}
+                  </span>
+                  <span className="ml-2 text-[10px] rounded px-1.5 py-0.5"
+                    style={{ background: 'rgba(107,114,128,0.1)', color: 'var(--color-text-muted)' }}>
+                    {b.reason}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  {b.has_compose && (<>
+                    <button onClick={() => viewBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="View compose YAML in browser">
+                      <Eye size={10} /> View
+                    </button>
+                    <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Download compose YAML">
+                      <Download size={10} /> YAML
+                    </button>
+                  </>)}
+                  {confirmRestore === b.id ? (
+                    <span className="flex items-center gap-1">
+                      <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>Restore?</span>
+                      <button onClick={() => startRestoreStream(b.id)}
+                        className="text-[10px] px-1.5 py-0.5 rounded font-semibold"
+                        style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444' }}>
+                        Yes
+                      </button>
+                      <button onClick={() => setConfirmRestore(null)}
+                        className="btn-ghost text-[10px] px-1">
+                        No
+                      </button>
+                    </span>
+                  ) : (
+                    <button onClick={() => setConfirmRestore(b.id)} disabled={restoring}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Restore container from this backup">
+                      <RotateCcw size={10} /> Restore
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {restoreLogs.length > 0 && (
+              <div className="rounded-lg p-3 space-y-0.5 text-[11px] font-mono mt-2"
+                style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', maxHeight: '16vh', overflowY: 'auto' }}>
+                {restoreLogs.map((l, i) => <div key={i} style={{ color: 'var(--color-text-muted)' }}>{l}</div>)}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -618,12 +1035,12 @@ const RESTART_POLICIES = [
 ]
 
 function ConfigSection({ container, isProxmox, onContainerUpdate }) {
-  const [networks, setNetworks]   = useState(null)
-  const [curNet, setCurNet]       = useState('')
-  const [selNet, setSelNet]       = useState('')
+  const [networks, setNetworks]   = useState(null)  // all available Docker networks
+  const [curNets, setCurNets]     = useState([])     // live connected networks
+  const [selNet, setSelNet]       = useState('')     // selection in the "add" dropdown
   const [selPolicy, setSelPolicy] = useState(container.restart_policy || 'no')
   const [retries, setRetries]     = useState(0)
-  const [busy, setBusy]           = useState(null) // 'network' | 'policy'
+  const [busy, setBusy]           = useState(null)   // 'connect:<net>' | 'disconnect:<net>' | 'policy'
   const [msg, setMsg]             = useState('')
 
   useEffect(() => {
@@ -631,21 +1048,56 @@ function ConfigSection({ container, isProxmox, onContainerUpdate }) {
     api.dockerContainerNetworks(container.id)
       .then(r => {
         if (!alive) return
-        setNetworks(r.networks || [])
-        setCurNet(r.current || '')
-        setSelNet(r.current || (r.networks && r.networks[0]) || '')
+        const nets = r.networks     || []
+        const live = r.current_nets || (r.current ? [r.current] : [])
+        setNetworks(nets)
+        setCurNets(live)
+        setSelNet('')  // always start with placeholder, user must explicitly choose
       })
       .catch(() => { if (alive) setNetworks([]) })
     return () => { alive = false }
   }, [container.id])
 
-  async function applyNetwork() {
-    setBusy('network'); setMsg('')
+  // Merge host metadata back — _fmt_container() doesn't include host_id/host_name,
+  // but the drawer's key is `${host_id}-${name}`, so losing host_id causes a remount.
+  function mergeHostMeta(updated) {
+    if (!updated) return updated
+    return {
+      ...updated,
+      host_id:       container.host_id,
+      host_name:     container.host_name,
+      host_url:      container.host_url,
+      host_local_ip: container.host_local_ip,
+      host_type:     container.host_type,
+    }
+  }
+
+  async function connectNetwork() {
+    if (!selNet) return
+    setBusy(`connect:${selNet}`); setMsg('')
     try {
-      const updated = await api.dockerSetNetwork(container.id, selNet)
+      const raw     = await api.dockerConnectNetwork(container.id, selNet)
+      const updated = mergeHostMeta(raw)
       if (updated && onContainerUpdate) onContainerUpdate(updated)
-      setCurNet(selNet)
-      setMsg(`[OK] Network changed to "${selNet}".`)
+      const newNets = [...curNets, selNet]
+      setCurNets(newNets)
+      setSelNet('')  // reset to placeholder after adding
+      setMsg(`[OK] Connected to "${selNet}".`)
+    } catch (e) {
+      setMsg(`[ERROR] ${e.message}`)
+    } finally { setBusy(null) }
+  }
+
+  async function disconnectNetwork(net) {
+    setBusy(`disconnect:${net}`); setMsg('')
+    try {
+      const raw     = await api.dockerDisconnectNetwork(container.id, net)
+      const updated = mergeHostMeta(raw)
+      if (updated && onContainerUpdate) onContainerUpdate(updated)
+      const newNets = curNets.filter(n => n !== net)
+      setCurNets(newNets)
+      setSelNet('')  // reset to placeholder
+      setMsg(`[OK] Disconnected from "${net}".`)
     } catch (e) {
       setMsg(`[ERROR] ${e.message}`)
     } finally { setBusy(null) }
@@ -676,26 +1128,62 @@ function ConfigSection({ container, isProxmox, onContainerUpdate }) {
           {networks === null ? (
             <p className="text-[11px] text-text-faint flex items-center gap-1.5"><Loader2 size={11} className="animate-spin" /> Loading…</p>
           ) : (
-            <>
-              <select className={selectCls} style={selectStyle} value={selNet}
-                onChange={e => setSelNet(e.target.value)} disabled={!!busy}>
-                {networks.length === 0 && <option value="">No networks found</option>}
-                {!networks.includes(curNet) && curNet && <option value={curNet}>{curNet} (current)</option>}
-                {networks.map(n => (
-                  <option key={n} value={n}>{n}{n === curNet ? ' (current)' : ''}</option>
-                ))}
-              </select>
+            <div className="space-y-2">
+              {/* Connected networks list */}
+              {curNets.length === 0 ? (
+                <p className="text-[11px] italic" style={{ color: 'var(--color-text-faint)' }}>
+                  Not connected to any network
+                </p>
+              ) : curNets.map(n => (
+                <div key={n} className="flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-xs"
+                  style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)' }}>
+                  <span className="font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                  <button
+                    onClick={() => disconnectNetwork(n)}
+                    disabled={!!busy}
+                    title={`Disconnect from ${n}`}
+                    className="flex-shrink-0 rounded p-0.5 transition-colors disabled:opacity-40"
+                    style={{ color: '#ef4444' }}>
+                    {busy === `disconnect:${n}`
+                      ? <Loader2 size={12} className="animate-spin" />
+                      : <X size={12} />}
+                  </button>
+                </div>
+              ))}
+
+              {/* Add network */}
+              {!isProxmox && (() => {
+                const available = networks.filter(n => !curNets.includes(n))
+                return (
+                  <div className="flex gap-2 pt-1">
+                    <select className={selectCls} style={{ ...selectStyle, flex: 1 }}
+                      value={selNet} onChange={e => setSelNet(e.target.value)} disabled={!!busy}>
+                      <option value="">
+                        {available.length === 0 ? '— all networks connected —' : '— select network —'}
+                      </option>
+                      {available.map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                    <button
+                      onClick={connectNetwork}
+                      disabled={!!busy || !selNet}
+                      className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-medium flex-shrink-0
+                                 transition-colors border-indigo-500/40 bg-indigo-500/10 text-indigo-400
+                                 hover:bg-indigo-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
+                      {busy?.startsWith('connect:')
+                        ? <Loader2 size={12} className="animate-spin" />
+                        : <Check size={12} />}
+                      Add
+                    </button>
+                  </div>
+                )
+              })()}
               {!isProxmox && (
-                <p className="text-[10px] text-text-faint">User networks attach live. Switching to <span className="font-mono">host</span>/<span className="font-mono">none</span> recreates the container (config preserved).</p>
+                <p className="text-[10px]" style={{ color: 'var(--color-text-faint)' }}>
+                  Containers can be connected to multiple networks simultaneously.
+                  Switching to <span className="font-mono">host</span>/<span className="font-mono">none</span> requires recreating the container.
+                </p>
               )}
-              <button onClick={applyNetwork} disabled={!!busy || !selNet || selNet === curNet}
-                className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium w-full
-                           transition-colors border-indigo-500/40 bg-indigo-500/10 text-indigo-400
-                           hover:bg-indigo-500/20 disabled:opacity-40 disabled:cursor-not-allowed">
-                {busy === 'network' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
-                {busy === 'network' ? 'Applying…' : 'Apply Network'}
-              </button>
-            </>
+            </div>
           )}
         </div>
 
@@ -831,8 +1319,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
   const [streaming,   setStreaming]   = useState(false)
   const [streamMode,  setStreamMode]  = useState(null)   // 'scan' | 'update'
   const [scanResult,  setScanResult]  = useState(null)
-  const [backups,     setBackups]     = useState(null)
-  const [showBackups, setShowBackups] = useState(false)
+  const [backups,           setBackups]           = useState(null)
+  const [showBackups,       setShowBackups]       = useState(false)
+  const [confirmRecreate,   setConfirmRecreate]   = useState(null)  // null | backup id
+  const [recreatingBackup,  setRecreatingBackup] = useState(false)
+  const [viewYaml,          setViewYaml]          = useState(null)  // { title, yaml }
 
   const stackRole = INSPECTRE_STACK[container.name] || null
   const [confirm,          setConfirm]          = useState(null)   // null | 'update' | 'force'
@@ -930,6 +1421,16 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
     }
   }
 
+  async function resetStuckUpdate() {
+    try {
+      await api.dockerResetUpdate(container.id)
+      setLogs(l => [...l, 'Stuck update reset — you can now retry.'])
+      await refreshStatus(container.id)
+    } catch (e) {
+      setLogs(l => [...l, `[ERROR] ${e.message}`])
+    }
+  }
+
   function startStream(mode, force = false, scanFirst = true) {
     if (streaming) return
     setLogs([])
@@ -960,6 +1461,9 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
       if (line.startsWith('UPDATE_DONE:') || line.startsWith('UPDATE_BLOCKED:') || line.startsWith('SCAN_DONE:')) {
         setStreaming(false)
         refreshStatus()
+        if (line.startsWith('UPDATE_DONE:') || line.startsWith('UPDATE_BLOCKED:')) {
+          setActiveTab('updates')
+        }
         return
       }
       setLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
@@ -1012,11 +1516,61 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
     } catch (_) {}
   }
 
+  async function viewBackupCompose(backupId, name) {
+    try {
+      const res = await api.dockerGetBackupCompose(backupId)
+      setViewYaml({ title: `Backup #${backupId} — ${name}`, yaml: res.compose_yaml })
+    } catch (_) {}
+  }
+
+  function startRecreateStream(backupId) {
+    if (streaming || recreatingBackup) return
+    setConfirmRecreate(null)
+    setLogs([])
+    setScanResult(null)
+    setStreamMode('recreate')
+    setStreaming(true)
+    setRecreatingBackup(true)
+
+    const ctrl = new AbortController()
+    abortRef.current = ctrl
+
+    const onLine = line => {
+      if (line.startsWith('RECREATE_ERROR:')) {
+        setLogs(l => [...l, '❌ ' + line.slice(15)])
+        setStreaming(false)
+        setRecreatingBackup(false)
+        return
+      }
+      if (line === 'RECREATE_DONE') {
+        setLogs(l => [...l, '✅ Container recreated successfully.'])
+        setStreaming(false)
+        setRecreatingBackup(false)
+        loadBackups()
+        return
+      }
+      setLogs(l => [...l, line.replace(/^LOG:\s*/, '')])
+    }
+
+    api.dockerRecreateFromBackup(backupId, onLine, ctrl.signal)
+      .catch(e => {
+        setLogs(l => [...l, `❌ Restore failed: ${e.message || 'Unknown error'}`])
+        setStreaming(false)
+        setRecreatingBackup(false)
+      })
+  }
+
   const hasUpdate      = status?.has_update
   const isBlocked      = status?.update_blocked && hasUpdate
   const isUpdating     = status?.update_in_progress
   const isPinned       = status?.pinned
   const updateDisabled = stackRole === 'db'
+
+  const updateBtnTitle = updateDisabled  ? 'Cannot update the database container here — use Settings → About'
+    : isPinned                           ? 'Image is pinned — click Unpin to enable updates'
+    : isUpdating                         ? 'Update already in progress'
+    : streaming                          ? 'Another operation is in progress'
+    : ''
 
   const scanVulns  = status?.new_image_vulns || []
   const scanCrit   = (scanVulns).filter(v => v.severity === 'critical').length
@@ -1050,6 +1604,9 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
   return (
     <div className="space-y-4">
+      {viewYaml && (
+        <YamlViewModal title={viewYaml.title} yaml={viewYaml.yaml} onClose={() => setViewYaml(null)} />
+      )}
 
       {/* ── InSpectre stack warning ── */}
       {stackRole && <InspectreStackNotice role={stackRole} name={container.name} />}
@@ -1165,9 +1722,17 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
           </div>
         )}
 
+        {/* Stuck update warning */}
+        {isUpdating && (
+          <div className="rounded-lg px-3 py-2 text-xs"
+            style={{ background: 'rgba(96,165,250,0.08)', border: '1px solid rgba(96,165,250,0.25)', color: '#60a5fa' }}>
+            Update in progress. If this has been stuck for more than 30 minutes, use <strong>Reset Stuck Update</strong> below to clear it and retry.
+          </div>
+        )}
+
         {/* Check now button */}
-        <div className="flex items-center gap-2 pt-1">
-          <button onClick={checkNow} disabled={checking || streaming}
+        <div className="flex items-center gap-2 pt-1 flex-wrap">
+          <button onClick={checkNow} disabled={checking || streaming || isUpdating}
             className="btn-ghost flex items-center gap-1.5 text-xs">
             <RefreshCw size={12} className={checking ? 'animate-spin' : ''} />
             {checking ? 'Checking…' : 'Check Now'}
@@ -1177,6 +1742,14 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
             {isPinned ? <PinOff size={12} /> : <Pin size={12} />}
             {isPinned ? 'Unpin' : 'Pin'}
           </button>
+          {isUpdating && (
+            <button onClick={resetStuckUpdate} disabled={streaming}
+              className="btn-ghost flex items-center gap-1.5 text-xs"
+              style={{ color: '#f97316' }}>
+              <RefreshCw size={12} />
+              Reset Stuck Update
+            </button>
+          )}
         </div>
       </div>
 
@@ -1195,9 +1768,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
           {hasUpdate && !isBlocked && (
             <button onClick={() => setConfirm('update')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              title={updateBtnTitle || undefined}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
               style={{ background: 'rgba(56,189,248,0.12)', color: '#38bdf8', border: '1px solid rgba(56,189,248,0.3)',
-                       opacity: updateDisabled ? 0.4 : 1 }}>
+                       opacity: (streaming || isUpdating || isPinned || updateDisabled) ? 0.4 : 1,
+                       cursor:  (streaming || isUpdating || isPinned || updateDisabled) ? 'not-allowed' : undefined }}>
               <ArrowUpCircle size={12} />
               Update
             </button>
@@ -1205,9 +1780,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
           {hasUpdate && !isBlocked && (
             <button onClick={() => setConfirm('scanupdate')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              title={updateBtnTitle || undefined}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
               style={{ background: 'rgba(56,189,248,0.12)', color: '#38bdf8', border: '1px solid rgba(56,189,248,0.3)',
-                       opacity: updateDisabled ? 0.4 : 1 }}>
+                       opacity: (streaming || isUpdating || isPinned || updateDisabled) ? 0.4 : 1,
+                       cursor:  (streaming || isUpdating || isPinned || updateDisabled) ? 'not-allowed' : undefined }}>
               <Shield size={12} />
               Scan &amp; Update
             </button>
@@ -1215,9 +1792,11 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
 
           {isBlocked && (
             <button onClick={() => setConfirm('force')} disabled={streaming || isUpdating || isPinned || updateDisabled}
+              title={updateBtnTitle || undefined}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg font-medium"
               style={{ background: 'rgba(249,115,22,0.12)', color: '#f97316', border: '1px solid rgba(249,115,22,0.3)',
-                       opacity: updateDisabled ? 0.4 : 1 }}>
+                       opacity: (streaming || isUpdating || isPinned || updateDisabled) ? 0.4 : 1,
+                       cursor:  (streaming || isUpdating || isPinned || updateDisabled) ? 'not-allowed' : undefined }}>
               <AlertTriangle size={12} />
               Force Update
             </button>
@@ -1326,7 +1905,7 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
         <div className="card p-4 space-y-2">
           <span className="text-xs font-semibold flex items-center gap-1.5" style={{ color: 'var(--color-text)' }}>
             <Terminal size={12} />
-            {streamMode === 'scan' ? 'Scan Log' : 'Update Log'}
+            {streamMode === 'scan' ? 'Scan Log' : streamMode === 'recreate' ? 'Recreate Log' : 'Update Log'}
             {streaming && <Loader2 size={10} className="animate-spin ml-1" />}
           </span>
           <div className="rounded-lg p-3 font-mono text-[11px] space-y-0.5 max-h-56 overflow-y-auto"
@@ -1375,14 +1954,43 @@ function UpdatesTab({ container, updateStatus: initialStatus }) {
                     {b.reason}
                   </span>
                 </div>
-                {b.has_compose && (
-                  <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
-                    className="btn-ghost flex items-center gap-1 text-[11px] shrink-0"
-                    title="Download compose YAML for this backup">
-                    <Download size={10} />
-                    YAML
-                  </button>
-                )}
+                <div className="flex items-center gap-1 shrink-0">
+                  {b.has_compose && (<>
+                    <button onClick={() => viewBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="View compose YAML in browser">
+                      <Eye size={10} /> View
+                    </button>
+                    <button onClick={() => downloadBackupCompose(b.id, b.container_name)}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Download compose YAML for this backup">
+                      <Download size={10} /> YAML
+                    </button>
+                  </>)}
+                  {confirmRecreate === b.id ? (
+                    <span className="flex items-center gap-1">
+                      <span className="text-[10px]" style={{ color: 'var(--color-text-muted)' }}>Recreate?</span>
+                      <button onClick={() => startRecreateStream(b.id)}
+                        className="text-[10px] px-1.5 py-0.5 rounded font-semibold"
+                        style={{ background: 'rgba(239,68,68,0.15)', color: '#ef4444' }}>
+                        Yes
+                      </button>
+                      <button onClick={() => setConfirmRecreate(null)}
+                        className="btn-ghost text-[10px] px-1">
+                        No
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmRecreate(b.id)}
+                      disabled={streaming || recreatingBackup}
+                      className="btn-ghost flex items-center gap-1 text-[11px]"
+                      title="Recreate this container from backup config (ports auto-fixed)">
+                      <RotateCcw size={10} />
+                      Recreate
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
@@ -1396,11 +2004,11 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
   const [container,   setContainer]   = useState(initialContainer)
   const isProxmox   = container.host_type === 'proxmox'
   const visibleTabs = isProxmox
-    ? TABS.filter(t => !['logs', 'vuln', 'compose', 'updates'].includes(t.id))
+    ? TABS.filter(t => !['logs', 'console', 'compose', 'updates'].includes(t.id))
     : TABS
   const startTab    = initialTab || 'overview'
   const [activeTab,   setActiveTab]   = useState(
-    isProxmox && (startTab === 'logs' || startTab === 'vuln') ? 'overview' : startTab
+    isProxmox && startTab === 'logs' ? 'overview' : startTab
   )
   const [actioning,   setActioning]   = useState(null)
   const [actionMsg,   setActionMsg]   = useState('')
@@ -1496,12 +2104,12 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
           </div>
         </div>
 
-        {/* Tab bar */}
-        <div className="flex border-b border-border px-4 gap-0 overflow-x-auto scrollbar-none"
+        {/* Keep the full tab set visible in a compact grid. */}
+        <div className={`grid ${visibleTabs.length > 5 ? 'grid-cols-4 sm:grid-cols-7' : 'grid-cols-4'} border-b border-border`}
           style={{ background: 'var(--color-surface)' }}>
           {visibleTabs.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)}
-              className="px-3 py-3 text-xs font-medium border-b-2 transition-colors whitespace-nowrap shrink-0"
+              className="min-w-0 px-1 py-2 sm:px-1.5 sm:py-2.5 text-[11px] sm:text-xs font-medium border-b-2 transition-colors text-center whitespace-nowrap"
               style={activeTab === tab.id
                 ? { borderColor: 'var(--color-brand)', color: 'var(--color-brand)' }
                 : { borderColor: 'transparent', color: 'var(--color-text-muted)' }}>
@@ -1514,7 +2122,7 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+        <div className="flex-1 overflow-y-auto px-6 py-5 pb-16 space-y-6">
 
           {/* ── Overview tab ── */}
           {activeTab === 'overview' && (
@@ -1583,7 +2191,14 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
                 <Collapsible title={`Networks (${container.networks.length})`} icon={Network} defaultOpen={false}>
                   {container.networks.map((n, i) => (
                     <div key={i} className="py-1.5 border-b border-border last:border-0">
-                      <span className="text-xs font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-mono" style={{ color: 'var(--color-text)' }}>{n}</span>
+                        {!isProxmox && (
+                          <span className="text-xs font-mono text-brand">
+                            {container.network_ips?.[n] || 'no IP'}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </Collapsible>
@@ -1671,9 +2286,17 @@ export function ContainerDrawer({ container: initialContainer, trivyScan, update
             />
           )}
 
-          {/* ── Vuln tab ── */}
+          {activeTab === 'console' && (
+            <ConsoleErrorBoundary key={container.id}>
+              <Suspense fallback={<div className="text-xs text-text-faint">Loading terminal…</div>}>
+                <ContainerConsole container={container} />
+              </Suspense>
+            </ConsoleErrorBoundary>
+          )}
+
+          {/* ── Security tab ── */}
           {activeTab === 'vuln' && (
-            <VulnTab
+            <SecurityTab
               container={container}
               trivyScan={trivyScan}
               updateTrivyScan={updateTrivyScan}

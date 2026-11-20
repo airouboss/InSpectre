@@ -17,8 +17,12 @@ const SETTING_META = {
   // Scanner tab
   scan_interval:           { label: 'Scan Interval',       unit: 'seconds',       type: 'number', min: 5,  max: 3600, tab: 'scanner',
     description: 'How often the probe sweeps the network looking for devices.' },
-  offline_miss_threshold:  { label: 'Offline Threshold',   unit: 'missed sweeps', type: 'number', min: 1,  max: 20,   tab: 'scanner',
-    description: 'How many consecutive missed ARP sweeps before a device is marked offline.' },
+  presence_grace_seconds:  { label: 'Offline Grace Period', unit: 'seconds',       type: 'number', min: 60, max: 1800, tab: 'scanner',
+    description: 'How long without any network signal (ARP, passive traffic, DHCP, mDNS) before a device is marked offline. Default 240s (4 min) covers typical phone sleep cycles.' },
+  person_presence_cooldown: { label: 'Person Arrival Cooldown', unit: 'seconds', type: 'number', min: 60, max: 3600, tab: 'scanner',
+    description: 'Minimum time between repeated "Arrived Home" notifications for the same person. Safety net for rapid re-arrivals. Default 600s (10 min).' },
+  person_away_confirm_seconds: { label: 'Departure Confirmation Window', unit: 'seconds', type: 'number', min: 0, max: 600, tab: 'scanner',
+    description: 'Extra buffer after a device goes offline before "Left Home" fires. The probe\'s Offline Grace Period already filters short dropouts — this adds a small extra delay on top. Default 60s.' },
   sniffer_workers:         { label: 'Sniffer Workers',     unit: 'threads',       type: 'number', min: 1,  max: 16,   tab: 'scanner',
     description: 'Number of parallel packet capture threads. Requires probe restart to take effect.' },
   arp_scan_retry:          { label: 'ARP Sweep Retries',   unit: 'extra rounds',  type: 'number', min: 0,  max: 3,    tab: 'scanner',
@@ -105,13 +109,21 @@ const SETTING_META = {
     description: 'How often to check Docker registries for newer image versions. Uses only registry manifest calls — no image pulls.' },
   container_auto_update: { label: 'Auto-Update Mode', type: 'select', tab: 'docker',
     options: [
-      { value: 'disabled',        label: 'Disabled — notify only' },
-      { value: 'scan_then_update', label: 'Scan then update (block on critical CVEs)' },
-      { value: 'auto',            label: 'Auto-update (no scan gate)' },
+      { value: 'disabled',         label: 'Disabled — check only, no action' },
+      { value: 'notify',           label: 'Notify only — alert when update found' },
+      { value: 'scan_then_update', label: 'Scan then update — Trivy scan, then update if policy allows' },
+      { value: 'auto',             label: 'Auto — update immediately (no scan gate)' },
     ],
     description: 'What to do when an update is detected. Scan-then-update runs Trivy on the new image before deploying.' },
-  container_update_block_critical: { label: 'Block Updates with Critical CVEs', type: 'toggle', tab: 'docker',
-    description: 'Prevent container updates if the new image contains critical-severity CVEs. The update can still be forced manually from the drawer.' },
+  container_update_vuln_policy: { label: 'Vulnerability Block Policy', type: 'select', tab: 'docker',
+    options: [
+      { value: 'always_update',    label: 'Always update — ignore vulnerabilities' },
+      { value: 'block_on_critical', label: 'Block if critical CVEs present' },
+      { value: 'block_on_high',    label: 'Block if high or critical CVEs present' },
+    ],
+    description: 'When Scan-then-update mode is active, controls which vulnerability severity triggers a block. The update can still be forced manually from the container drawer.' },
+  container_update_block_if_worse: { label: 'Block Only if New Image is Worse', type: 'toggle', tab: 'docker',
+    description: 'When enabled, blocks the update only if the new image has MORE critical CVEs than the currently running image — an image that is equally or less vulnerable will proceed. Works alongside the policy above.' },
   container_backup_enabled: { label: 'Auto-Backup Before Update', type: 'toggle', tab: 'docker',
     description: 'Always capture a full config backup (docker inspect JSON + compose YAML) before any container update.' },
   container_update_health_timeout: { label: 'Health Check Timeout (seconds)', type: 'text', tab: 'docker',
@@ -192,13 +204,23 @@ const SETTING_META = {
     description: 'Re-scan all online devices during the configured nightly scan window. Disable to prevent automatic overnight port scan storms.' },
   enable_unscanned_retry: { label: 'Retry Unscanned Devices Each Cycle', type: 'toggle', tab: 'scanner',
     description: 'On each sweep cycle, trigger a port scan for any device that has never been scanned. Disable if new devices are causing too many simultaneous scans.' },
+
+  // Device Lifecycle
+  new_device_threshold_enabled: { label: 'Auto-expire "New" Status', type: 'toggle', tab: 'scanner',
+    description: 'Automatically mark devices as acknowledged (no longer highlighted as new) after they have been known for the configured period.' },
+  new_device_threshold_value:   { tab: 'scanner' },
+  new_device_threshold_unit:    { tab: 'scanner' },
+  stale_device_auto_delete_enabled: { label: 'Auto-delete Stale Devices', type: 'toggle', tab: 'scanner',
+    description: 'Automatically remove devices that have not been seen for the configured period. Important devices and group primary devices are protected — only stale grouped sub-interfaces and ungrouped devices are deleted.' },
+  stale_device_auto_delete_value:   { tab: 'scanner' },
+  stale_device_auto_delete_unit:    { tab: 'scanner' },
 }
 
 // Docker keys handled as custom cards
 const DOCKER_KEYS = new Set(['docker_enabled','docker_host','docker_tls_verify'])
 
 const TABS = [
-  { id: 'scanner',       label: 'Scanner',       Icon: ScanLine  },
+  { id: 'scanner',       label: 'General',       Icon: ScanLine  },
   { id: 'notifications', label: 'Notifications', Icon: Bell      },
   { id: 'plugins',       label: 'Plugins',       Icon: Package   },
   { id: 'docker',        label: 'Docker',        Icon: Box       },
@@ -240,6 +262,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   const [blockPlugins,      setBlockPlugins]      = useState([])
   const [blockPluginError,  setBlockPluginError]  = useState('')
 
+  const [saveError,         setSaveError]         = useState('')
   const [trivyDbStatus,     setTrivyDbStatus]     = useState(null)
   const [trivyUpdating,     setTrivyUpdating]     = useState(false)
   const [trivyLines,        setTrivyLines]        = useState([])
@@ -349,6 +372,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
   async function handleSave() {
     setSaving(true)
+    setSaveError('')
     setBlockPluginError('')
     try {
       await Promise.all(
@@ -358,6 +382,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
       const msg = e?.message || String(e)
       if (msg.includes('block_plugin') || dirty.block_plugin_id !== undefined) {
         setBlockPluginError(msg.replace(/^.*\d+\s*/, ''))
+      } else {
+        setSaveError(msg.replace(/^.*?\d{3}[: ]*/, '') || 'Failed to save — check backend logs.')
       }
       setSaving(false)
       return
@@ -480,7 +506,7 @@ export function SettingsPanel({ onClose, onSettingChange }) {
   }
 
   // ── Scanner tab grouping ────────────────────────────────────────────────────
-  const networkScanKeys   = ['scan_interval','offline_miss_threshold']
+  const networkScanKeys   = ['scan_interval','presence_grace_seconds']
   const networkConfigKeys = ['ip_range','dns_server','probe_interface']
 
   function settingsByKeys(keys) {
@@ -753,6 +779,107 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                 })()}
               </CollapsibleSection>
 
+              {/* Device Lifecycle */}
+              <CollapsibleSection label="Device Lifecycle" Icon={RefreshCw} defaultOpen={false}>
+                {/* New device threshold — rendered inline so it shows even before backend restart seeds the setting */}
+                {(() => {
+                  const newEnabled = (val('new_device_threshold_enabled') || 'false') === 'true'
+                  return (
+                    <div className="card p-4 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                          Auto-expire "New" Status
+                        </label>
+                        <button type="button" role="switch" aria-checked={newEnabled}
+                          onClick={() => handleChange('new_device_threshold_enabled', newEnabled ? 'false' : 'true')}
+                          className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none"
+                          style={{ background: newEnabled ? 'var(--color-brand)' : 'var(--color-border)', flexShrink: 0 }}>
+                          <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                            style={{ transform: newEnabled ? 'translateX(22px)' : 'translateX(4px)' }} />
+                        </button>
+                      </div>
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        Automatically mark devices as acknowledged (no longer highlighted as new) after they have been known for the configured period.
+                      </p>
+                      {newEnabled && (
+                        <div className="space-y-1 pt-1">
+                          <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Mark as acknowledged after</label>
+                          <div className="flex gap-2">
+                            <input type="number" min="1" max="999"
+                              value={val('new_device_threshold_value') || '7'}
+                              onChange={e => handleChange('new_device_threshold_value', e.target.value)}
+                              className="w-24 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            />
+                            <select
+                              value={val('new_device_threshold_unit') || 'day'}
+                              onChange={e => handleChange('new_device_threshold_unit', e.target.value)}
+                              className="flex-1 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            >
+                              <option value="day">Days</option>
+                              <option value="week">Weeks</option>
+                              <option value="month">Months</option>
+                              <option value="year">Years</option>
+                            </select>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })()}
+
+                {/* Stale device auto-delete — same inline pattern */}
+                {(() => {
+                  const staleEnabled = (val('stale_device_auto_delete_enabled') || 'false') === 'true'
+                  return (
+                    <div className="card p-4 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                          Auto-delete Stale Devices
+                        </label>
+                        <button type="button" role="switch" aria-checked={staleEnabled}
+                          onClick={() => handleChange('stale_device_auto_delete_enabled', staleEnabled ? 'false' : 'true')}
+                          className="relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none"
+                          style={{ background: staleEnabled ? 'var(--color-brand)' : 'var(--color-border)', flexShrink: 0 }}>
+                          <span className="inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200"
+                            style={{ transform: staleEnabled ? 'translateX(22px)' : 'translateX(4px)' }} />
+                        </button>
+                      </div>
+                      <p className="text-xs" style={{ color: 'var(--color-text-faint)' }}>
+                        Automatically remove devices that have not been seen for the configured period.
+                        Important devices and group primary devices are protected — only stale grouped
+                        sub-interfaces (e.g. a phone's old randomised MAC) and ungrouped devices are eligible.
+                      </p>
+                      {staleEnabled && (
+                        <div className="space-y-1 pt-1">
+                          <label className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Auto-delete after not seen for</label>
+                          <div className="flex gap-2">
+                            <input type="number" min="1" max="999"
+                              value={val('stale_device_auto_delete_value') || '90'}
+                              onChange={e => handleChange('stale_device_auto_delete_value', e.target.value)}
+                              className="w-24 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            />
+                            <select
+                              value={val('stale_device_auto_delete_unit') || 'day'}
+                              onChange={e => handleChange('stale_device_auto_delete_unit', e.target.value)}
+                              className="flex-1 rounded-lg px-3 py-2 text-sm"
+                              style={{ background: 'var(--color-surface-offset)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                            >
+                              <option value="day">Days</option>
+                              <option value="week">Weeks</option>
+                              <option value="month">Months</option>
+                              <option value="year">Years</option>
+                            </select>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })()}
+              </CollapsibleSection>
+
               {/* ── Here Be Dragons ─────────────────────────────────────── */}
               <button
                 type="button"
@@ -967,7 +1094,8 @@ export function SettingsPanel({ onClose, onSettingChange }) {
                   Update schedule and auto-update mode are configured in the <strong>Containers</strong> page.
                 </p>
                 {settingsByKeys([
-                  'container_update_block_critical',
+                  'container_update_vuln_policy',
+                  'container_update_block_if_worse',
                   'container_backup_enabled',
                   'container_update_health_timeout',
                   'container_update_stagger_seconds',
@@ -1472,15 +1600,23 @@ export function SettingsPanel({ onClose, onSettingChange }) {
 
         {/* Footer */}
         {showFooter && (
-          <div className="px-6 py-4 flex gap-3" style={{ borderTop: '1px solid var(--color-border)' }}>
-            <button onClick={handleSave} disabled={!hasDirty || saving}
-              className={`btn-primary flex-1 flex items-center justify-center gap-2 ${!hasDirty || saving ? 'opacity-40 cursor-not-allowed' : ''}`}>
-              <Save size={14} />
-              {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save Changes'}
-            </button>
-            <button onClick={handleReset} className="btn-ghost flex items-center gap-2">
-              <RotateCcw size={14} /> Reset
-            </button>
+          <div className="px-6 py-4 space-y-2" style={{ borderTop: '1px solid var(--color-border)' }}>
+            {saveError && (
+              <p className="text-xs px-3 py-2 rounded-lg"
+                style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444' }}>
+                Save failed: {saveError}
+              </p>
+            )}
+            <div className="flex gap-3">
+              <button onClick={handleSave} disabled={!hasDirty || saving}
+                className={`btn-primary flex-1 flex items-center justify-center gap-2 ${!hasDirty || saving ? 'opacity-40 cursor-not-allowed' : ''}`}>
+                <Save size={14} />
+                {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save Changes'}
+              </button>
+              <button onClick={handleReset} className="btn-ghost flex items-center gap-2">
+                <RotateCcw size={14} /> Reset
+              </button>
+            </div>
           </div>
         )}
       </aside>
